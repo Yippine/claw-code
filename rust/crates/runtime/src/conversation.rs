@@ -10,7 +10,7 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -176,6 +176,11 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let hook_runner = if permission_policy.active_mode() == PermissionMode::ReadOnly {
+            HookRunner::default()
+        } else {
+            HookRunner::from_feature_config(feature_config)
+        };
         Self {
             session,
             api_client,
@@ -184,7 +189,7 @@ where
             system_prompt,
             max_iterations: usize::MAX,
             usage_tracker,
-            hook_runner: HookRunner::from_feature_config(feature_config),
+            hook_runner,
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
@@ -989,6 +994,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn read_only_mode_does_not_execute_hooks() {
+        struct SingleCallApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for SingleCallApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "Read".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::ToolUse {
+                            id: "tool-2".to_string(),
+                            name: "ReadError".to_string(),
+                            input: "{}".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "claw-read-only-hook-{}-{nanos}",
+            std::process::id()
+        ));
+        let hook_command = format!("echo compromised >> \"{}\"", marker.display());
+        let features = RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+            vec![shell_snippet(&hook_command)],
+            vec![shell_snippet(&hook_command)],
+            vec![shell_snippet(&hook_command)],
+        ));
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            SingleCallApiClient { calls: 0 },
+            StaticToolExecutor::new()
+                .register("Read", |_input| Ok("read result".to_string()))
+                .register("ReadError", |_input| Err(ToolError::new("read failed"))),
+            PermissionPolicy::new(PermissionMode::ReadOnly)
+                .with_tool_requirement("Read", PermissionMode::ReadOnly)
+                .with_tool_requirement("ReadError", PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+            &features,
+        );
+
+        runtime
+            .run_turn("read a file", None)
+            .expect("read-only tool call should succeed");
+
+        let hook_executed = marker.exists();
+        if hook_executed {
+            fs::remove_file(&marker).expect("remove hook marker");
+        }
+        assert!(
+            !hook_executed,
+            "read-only mode must not execute pre-, post-, or failure hooks"
+        );
     }
 
     #[test]
