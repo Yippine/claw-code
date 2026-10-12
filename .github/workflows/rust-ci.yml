@@ -25,6 +25,8 @@ on:
       - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
+      - flake.nix
+      - .envrc
   pull_request:
     branches:
       - main
@@ -47,6 +49,8 @@ on:
       - tests/test_roadmap_helpers.py
       - docs/**
       - rust/**
+      - flake.nix
+      - .envrc
   workflow_dispatch:
 
 concurrency:
