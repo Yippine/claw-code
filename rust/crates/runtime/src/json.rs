@@ -110,9 +110,7 @@ impl JsonValue {
     }
 }
 
-fn parse_value(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<JsonValue, JsonError> {
+fn parse_value(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsonValue, JsonError> {
     match chars.peek() {
         Some('n') => parse_null(chars),
         Some('t') | Some('f') => parse_bool(chars),
@@ -143,9 +141,7 @@ fn parse_bool(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsonVa
     Err(JsonError::new("invalid bool"))
 }
 
-fn parse_string(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<String, JsonError> {
+fn parse_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<String, JsonError> {
     if chars.next() != Some('"') {
         return Err(JsonError::new("expected opening quote"));
     }
@@ -155,47 +151,42 @@ fn parse_string(
         match chars.next() {
             None => return Err(JsonError::new("unterminated string")),
             Some('"') => return Ok(result),
-            Some('\\') => {
-                match chars.next() {
-                    Some('"') => result.push('"'),
-                    Some('\\') => result.push('\\'),
-                    Some('/') => result.push('/'),
-                    Some('b') => result.push('\u{08}'),
-                    Some('f') => result.push('\u{0C}'),
-                    Some('n') => result.push('\n'),
-                    Some('r') => result.push('\r'),
-                    Some('t') => result.push('\t'),
-                    Some('u') => {
-                        let mut hex = String::new();
-                        for _ in 0..4 {
-                            match chars.next() {
-                                Some(c @ '0'..='9')
-                                | Some(c @ 'a'..='f')
-                                | Some(c @ 'A'..='F') => hex.push(c),
-                                _ => return Err(JsonError::new("invalid unicode escape")),
+            Some('\\') => match chars.next() {
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some('b') => result.push('\u{08}'),
+                Some('f') => result.push('\u{0C}'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('u') => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        match chars.next() {
+                            Some(c @ '0'..='9') | Some(c @ 'a'..='f') | Some(c @ 'A'..='F') => {
+                                hex.push(c)
                             }
+                            _ => return Err(JsonError::new("invalid unicode escape")),
                         }
-                        let code = u32::from_str_radix(&hex, 16)
-                            .map_err(|_| JsonError::new("invalid hex code"))?;
-                        if (0xD800..=0xDFFF).contains(&code) {
-                            return Err(JsonError::new("surrogate not allowed"));
-                        }
-                        result.push(
-                            char::from_u32(code)
-                                .ok_or_else(|| JsonError::new("invalid codepoint"))?,
-                        );
                     }
-                    _ => return Err(JsonError::new("invalid escape")),
+                    let code = u32::from_str_radix(&hex, 16)
+                        .map_err(|_| JsonError::new("invalid hex code"))?;
+                    if (0xD800..=0xDFFF).contains(&code) {
+                        return Err(JsonError::new("surrogate not allowed"));
+                    }
+                    result.push(
+                        char::from_u32(code).ok_or_else(|| JsonError::new("invalid codepoint"))?,
+                    );
                 }
-            }
+                _ => return Err(JsonError::new("invalid escape")),
+            },
             Some(c) => result.push(c),
         }
     }
 }
 
-fn parse_number(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<JsonValue, JsonError> {
+fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsonValue, JsonError> {
     let mut num_str = String::new();
 
     if chars.peek() == Some(&'-') {
@@ -220,9 +211,7 @@ fn parse_number(
         .map_err(|_| JsonError::new("number out of range"))
 }
 
-fn parse_array(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<JsonValue, JsonError> {
+fn parse_array(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsonValue, JsonError> {
     if chars.next() != Some('[') {
         return Err(JsonError::new("expected ["));
     }
@@ -253,9 +242,7 @@ fn parse_array(
     }
 }
 
-fn parse_object(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<JsonValue, JsonError> {
+fn parse_object(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<JsonValue, JsonError> {
     if chars.next() != Some('{') {
         return Err(JsonError::new("expected {"));
     }
@@ -300,17 +287,15 @@ fn parse_object(
 }
 
 fn consume_literal(chars: &mut std::iter::Peekable<std::str::Chars>, literal: &str) -> bool {
-    let original: Vec<char> = chars.clone().collect();
-    for expected in literal.chars() {
-        match chars.next() {
-            Some(c) if c == expected => {}
-            _ => {
-                *chars = original.iter().copied().peekable();
-                return false;
-            }
+    let remaining: String = chars.clone().collect();
+    if remaining.starts_with(literal) {
+        for _ in literal.chars() {
+            chars.next();
         }
+        true
+    } else {
+        false
     }
-    true
 }
 
 fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars>) {
@@ -413,9 +398,7 @@ mod tests {
             Some(-42)
         );
         assert_eq!(
-            JsonValue::parse("  123  ")
-                .expect("padded parses")
-                .as_i64(),
+            JsonValue::parse("  123  ").expect("padded parses").as_i64(),
             Some(123)
         );
     }
@@ -449,8 +432,7 @@ mod tests {
         );
         let original = JsonValue::Object(object);
 
-        let reparsed =
-            JsonValue::parse(&original.render()).expect("rendered json should re-parse");
+        let reparsed = JsonValue::parse(&original.render()).expect("rendered json should re-parse");
 
         assert_eq!(reparsed, original);
     }
