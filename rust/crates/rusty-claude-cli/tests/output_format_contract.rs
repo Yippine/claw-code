@@ -441,6 +441,9 @@ fn status_and_sandbox_emit_json_when_requested() {
 
 // #831: direct resume-safe slash commands should use the same local CliAction
 // JSON surfaces as their bare subcommands, not interactive_only guidance.
+// Note: /sandbox status depends on kernel support for user namespaces.
+// On systems with working user namespaces the status is "ok".
+// On systems without user namespaces the status is "warn" (#731).
 #[test]
 fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
     let root = unique_temp_dir("direct-resume-safe-slash-831");
@@ -451,11 +454,11 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
         .output()
         .expect("git init should launch");
 
-    for (command, expected_kind, expected_status) in [
-        ("/version", "version", "ok"),
-        ("/sandbox", "sandbox", "warn"),
-        ("/diff", "diff", "ok"),
-        ("/status", "status", "ok"),
+    for (command, expected_kind, expected_statuses) in [
+        ("/version", "version", &["ok"][..]),
+        ("/sandbox", "sandbox", &["ok", "warn"][..]),
+        ("/diff", "diff", &["ok"][..]),
+        ("/status", "status", &["ok"][..]),
     ] {
         let output = run_claw(&root, &["--output-format", "json", command], &[]);
         assert!(
@@ -470,9 +473,9 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
             .unwrap_or_else(|_| panic!("{command} must emit JSON (#831), got: {stdout:?}"));
 
         assert_eq!(parsed["kind"], expected_kind, "{command} kind: {parsed}");
-        assert_eq!(
-            parsed["status"], expected_status,
-            "{command} status: {parsed}"
+        assert!(
+            expected_statuses.contains(&parsed["status"].as_str().unwrap_or("")),
+            "{command} status must be one of {expected_statuses:?}: {parsed}"
         );
         assert_ne!(
             parsed["error_kind"], "interactive_only",
