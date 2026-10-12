@@ -6989,8 +6989,11 @@ fn run_resume_command(
         | SlashCommand::Pr { .. }
         | SlashCommand::Issue { .. }
         | SlashCommand::Ultraplan { .. }
+        | SlashCommand::Ultragoal { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall { .. }
+        | SlashCommand::Dump { .. }
+        | SlashCommand::Trace { .. }
         | SlashCommand::Resume { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
@@ -8231,12 +8234,24 @@ impl LiveCli {
                 self.run_ultraplan(task.as_deref())?;
                 false
             }
+            SlashCommand::Ultragoal { args } => {
+                self.run_ultragoal(args.as_deref())?;
+                false
+            }
             SlashCommand::Teleport { target } => {
                 Self::run_teleport(target.as_deref())?;
                 false
             }
             SlashCommand::DebugToolCall => {
                 self.run_debug_tool_call(None)?;
+                false
+            }
+            SlashCommand::Dump { scope } => {
+                self.run_dump(scope.as_deref())?;
+                false
+            }
+            SlashCommand::Trace { mode } => {
+                self.run_trace(mode.as_deref())?;
                 false
             }
             SlashCommand::Sandbox => {
@@ -9257,6 +9272,21 @@ impl LiveCli {
     fn run_debug_tool_call(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         validate_no_args("/debug-tool-call", args)?;
         println!("{}", render_last_tool_debug_report(self.runtime.session())?);
+        Ok(())
+    }
+
+    fn run_ultragoal(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", format_ultragoal_report(args));
+        Ok(())
+    }
+
+    fn run_dump(&self, scope: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", format_dump_report(scope));
+        Ok(())
+    }
+
+    fn run_trace(&self, mode: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", format_trace_report(mode));
         Ok(())
     }
 
@@ -11617,6 +11647,36 @@ fn format_ultraplan_report(task: Option<&str>) -> String {
   Action           break work into a multi-step execution plan
   Output           plan should cover goals, risks, sequencing, verification, and rollback",
         task.unwrap_or("the current repo work")
+    )
+}
+
+fn format_ultragoal_report(args: Option<&str>) -> String {
+    format!(
+        "Ultragoal
+  Args             {}
+  Action           start or manage a durable goal ledger with ultragoal workflow
+  Output           goal ledger state and operations on the goal tracking system",
+        args.unwrap_or("none")
+    )
+}
+
+fn format_dump_report(scope: Option<&str>) -> String {
+    format!(
+        "Dump
+  Scope            {}
+  Action           dump debugging information for the current session
+  Output           session state, messages, and internal debugging data",
+        scope.unwrap_or("session")
+    )
+}
+
+fn format_trace_report(mode: Option<&str>) -> String {
+    format!(
+        "Trace
+  Mode             {}
+  Action           enable or disable execution tracing
+  Output           execution trace information or confirmation of trace state",
+        mode.unwrap_or("current state")
     )
 }
 

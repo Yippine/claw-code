@@ -199,6 +199,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "ultragoal",
+        aliases: &[],
+        summary: "Start or manage a durable goal ledger with ultragoal workflow",
+        argument_hint: Some("[op|args]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "teleport",
         aliases: &[],
         summary: "Jump to a file or symbol by searching the workspace",
@@ -211,6 +218,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Replay the last tool call with debug details",
         argument_hint: None,
         resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "dump",
+        aliases: &[],
+        summary: "Dump debugging information for the current session",
+        argument_hint: Some("[scope]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "trace",
+        aliases: &[],
+        summary: "Enable or disable execution tracing",
+        argument_hint: Some("[on|off]"),
+        resume_supported: true,
     },
     SlashCommandSpec {
         name: "export",
@@ -1063,10 +1084,19 @@ pub enum SlashCommand {
     Ultraplan {
         task: Option<String>,
     },
+    Ultragoal {
+        args: Option<String>,
+    },
     Teleport {
         target: Option<String>,
     },
     DebugToolCall,
+    Dump {
+        scope: Option<String>,
+    },
+    Trace {
+        mode: Option<String>,
+    },
     Model {
         model: Option<String>,
     },
@@ -1248,8 +1278,11 @@ impl SlashCommand {
             Self::Init => "/init",
             Self::Bughunter { .. } => "/bughunter",
             Self::Ultraplan { .. } => "/ultraplan",
+            Self::Ultragoal { .. } => "/ultragoal",
             Self::Teleport { .. } => "/teleport",
             Self::DebugToolCall { .. } => "/debug-tool-call",
+            Self::Dump { .. } => "/dump",
+            Self::Trace { .. } => "/trace",
             Self::Resume { .. } => "/resume",
             Self::Model { .. } => "/model",
             Self::Permissions { .. } => "/permissions",
@@ -1349,6 +1382,7 @@ pub fn validate_slash_command_input(
         "pr" => SlashCommand::Pr { context: remainder },
         "issue" => SlashCommand::Issue { context: remainder },
         "ultraplan" => SlashCommand::Ultraplan { task: remainder },
+        "ultragoal" => SlashCommand::Ultragoal { args: remainder },
         "teleport" => SlashCommand::Teleport {
             target: Some(require_remainder(command, remainder, "<symbol-or-path>")?),
         },
@@ -1356,6 +1390,12 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::DebugToolCall
         }
+        "dump" => SlashCommand::Dump {
+            scope: optional_single_arg(command, &args, "[scope]")?,
+        },
+        "trace" => SlashCommand::Trace {
+            mode: optional_single_arg(command, &args, "[on|off]")?,
+        },
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
@@ -5340,8 +5380,11 @@ pub fn handle_slash_command(
         | SlashCommand::Pr { .. }
         | SlashCommand::Issue { .. }
         | SlashCommand::Ultraplan { .. }
+        | SlashCommand::Ultragoal { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall
+        | SlashCommand::Dump { .. }
+        | SlashCommand::Trace { .. }
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
@@ -5578,6 +5621,36 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/debug-tool-call"),
             Ok(Some(SlashCommand::DebugToolCall))
+        );
+        assert_eq!(
+            SlashCommand::parse("/dump"),
+            Ok(Some(SlashCommand::Dump { scope: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/dump session"),
+            Ok(Some(SlashCommand::Dump {
+                scope: Some("session".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/trace"),
+            Ok(Some(SlashCommand::Trace { mode: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/trace on"),
+            Ok(Some(SlashCommand::Trace {
+                mode: Some("on".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/ultragoal"),
+            Ok(Some(SlashCommand::Ultragoal { args: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/ultragoal create my-goal"),
+            Ok(Some(SlashCommand::Ultragoal {
+                args: Some("create my-goal".to_string())
+            }))
         );
         assert_eq!(
             SlashCommand::parse("/bughunter runtime"),
@@ -6020,7 +6093,10 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert!(help.contains("/ultragoal [op|args]"));
+        assert!(help.contains("/dump [scope]"));
+        assert!(help.contains("/trace [on|off]"));
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
