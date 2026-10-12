@@ -585,11 +585,14 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
             last_error,
         } => {
             assert_eq!(attempts, 2);
-            let details = last_error
-                .api_details()
-                .expect("last error should be a provider Api error");
-            assert_eq!(details.status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-            assert!(details.retryable);
+            assert!(matches!(
+                *last_error,
+                ApiError::Api {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    retryable: true,
+                    ..
+                }
+            ));
         }
         other => panic!("expected retries exhausted, got {other:?}"),
     }

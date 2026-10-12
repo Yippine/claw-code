@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::error::{ApiError, ApiErrorDetails};
+use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -239,7 +239,7 @@ impl OpenAiCompatClient {
                     .get("code")
                     .and_then(serde_json::Value::as_u64)
                     .map(|c| c as u16);
-                return Err(ApiError::Api(Box::new(ApiErrorDetails {
+                return Err(ApiError::Api {
                     status: reqwest::StatusCode::from_u16(code.unwrap_or(400))
                         .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     error_type: err_obj
@@ -255,7 +255,7 @@ impl OpenAiCompatClient {
                             .unwrap_or(reqwest::StatusCode::BAD_REQUEST),
                     ),
                     retry_after: None,
-                })));
+                });
             }
         }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
@@ -1613,7 +1613,7 @@ fn parse_sse_frame(
                     .map(|c| c as u16);
                 let status = reqwest::StatusCode::from_u16(code.unwrap_or(500))
                     .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-                return Err(ApiError::Api(Box::new(ApiErrorDetails {
+                return Err(ApiError::Api {
                     status,
                     error_type: err_obj
                         .get("type")
@@ -1625,12 +1625,12 @@ fn parse_sse_frame(
                     retryable: false,
                     suggested_action: suggested_action_for_status(status),
                     retry_after: None,
-                })));
+                });
             }
         }
         // Detect HTML responses
         if trimmed.starts_with('<') || trimmed.starts_with("<!") {
-            return Err(ApiError::Api(Box::new(ApiErrorDetails {
+            return Err(ApiError::Api {
                 status: reqwest::StatusCode::BAD_REQUEST,
                 error_type: Some("invalid_response".to_string()),
                 message: Some(
@@ -1641,7 +1641,7 @@ fn parse_sse_frame(
                 retryable: false,
                 suggested_action: Some("verify the API endpoint URL is correct".to_string()),
                 retry_after: None,
-            })));
+            });
         }
         return Ok(None);
     }
@@ -1665,7 +1665,7 @@ fn parse_sse_frame(
                 .map(|c| c as u16);
             let status = reqwest::StatusCode::from_u16(code.unwrap_or(400))
                 .unwrap_or(reqwest::StatusCode::BAD_REQUEST);
-            return Err(ApiError::Api(Box::new(ApiErrorDetails {
+            return Err(ApiError::Api {
                 status,
                 error_type: err_obj
                     .get("type")
@@ -1677,13 +1677,13 @@ fn parse_sse_frame(
                 retryable: false,
                 suggested_action: suggested_action_for_status(status),
                 retry_after: None,
-            })));
+            });
         }
     }
     // Detect HTML or other non-JSON responses early for better error messages
     let trimmed_payload = payload.trim();
     if trimmed_payload.starts_with('<') || trimmed_payload.starts_with("<!") {
-        return Err(ApiError::Api(Box::new(ApiErrorDetails {
+        return Err(ApiError::Api {
             status: reqwest::StatusCode::BAD_REQUEST,
             error_type: Some("invalid_response".to_string()),
             message: Some(
@@ -1694,7 +1694,7 @@ fn parse_sse_frame(
             retryable: false,
             suggested_action: Some("verify the API endpoint URL is correct".to_string()),
             retry_after: None,
-        })));
+        });
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
@@ -1754,7 +1754,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
 
     let suggested_action = suggested_action_for_status(status);
 
-    Err(ApiError::Api(Box::new(ApiErrorDetails {
+    Err(ApiError::Api {
         status,
         error_type: parsed_error
             .as_ref()
@@ -1767,7 +1767,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         retryable,
         suggested_action,
         retry_after,
-    })))
+    })
 }
 
 fn parse_retry_after(

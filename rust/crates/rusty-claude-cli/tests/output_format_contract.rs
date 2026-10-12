@@ -451,16 +451,11 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
         .output()
         .expect("git init should launch");
 
-    // `/sandbox`'s status reflects the host's real sandbox capability, so it is the one
-    // entry with more than one legitimate value: "ok" where namespace isolation works,
-    // "warn" where it is unsupported and only the filesystem sandbox is active (#731).
-    // This test is about #831 routing — that these commands produce a local JSON action
-    // instead of `interactive_only` — not about the kernel the suite happens to run on.
-    for (command, expected_kind, expected_statuses) in [
-        ("/version", "version", &["ok"][..]),
-        ("/sandbox", "sandbox", &["ok", "warn"][..]),
-        ("/diff", "diff", &["ok"][..]),
-        ("/status", "status", &["ok"][..]),
+    for (command, expected_kind, expected_status) in [
+        ("/version", "version", "ok"),
+        ("/sandbox", "sandbox", "warn"),
+        ("/diff", "diff", "ok"),
+        ("/status", "status", "ok"),
     ] {
         let output = run_claw(&root, &["--output-format", "json", command], &[]);
         assert!(
@@ -475,9 +470,9 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
             .unwrap_or_else(|_| panic!("{command} must emit JSON (#831), got: {stdout:?}"));
 
         assert_eq!(parsed["kind"], expected_kind, "{command} kind: {parsed}");
-        assert!(
-            expected_statuses.contains(&parsed["status"].as_str().unwrap_or_default()),
-            "{command} status should be one of {expected_statuses:?}: {parsed}"
+        assert_eq!(
+            parsed["status"], expected_status,
+            "{command} status: {parsed}"
         );
         assert_ne!(
             parsed["error_kind"], "interactive_only",
@@ -1012,13 +1007,13 @@ fn inventory_commands_emit_structured_json_when_requested() {
     assert!(
         !plugins
             .as_object()
-            .is_some_and(|o| o.contains_key("reload_runtime")),
+            .map_or(false, |o| o.contains_key("reload_runtime")),
         "plugins list should not include reload_runtime"
     );
     assert!(
         !plugins
             .as_object()
-            .is_some_and(|o| o.contains_key("target")),
+            .map_or(false, |o| o.contains_key("target")),
         "plugins list should not include target"
     );
     // #703: structured summary replaces prose message
@@ -1712,13 +1707,13 @@ fn resumed_inventory_commands_emit_structured_json_when_requested() {
     assert!(
         !plugins
             .as_object()
-            .is_some_and(|o| o.contains_key("reload_runtime")),
+            .map_or(false, |o| o.contains_key("reload_runtime")),
         "plugins list should not include reload_runtime"
     );
     assert!(
         !plugins
             .as_object()
-            .is_some_and(|o| o.contains_key("target")),
+            .map_or(false, |o| o.contains_key("target")),
         "plugins list should not include target"
     );
     assert!(
@@ -2951,7 +2946,7 @@ fn prompt_empty_arg_json_stdout_missing_prompt_823() {
         "claw prompt empty arg must retain abort action (#823); got: {parsed}"
     );
     assert!(
-        parsed["hint"].as_str().is_some_and(|h| !h.is_empty()),
+        parsed["hint"].as_str().map_or(false, |h| !h.is_empty()),
         "claw prompt empty arg missing_prompt hint must be non-empty (#823)"
     );
 }
@@ -2989,9 +2984,9 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
         "invalid --reasoning-effort must be invalid_flag_value (#756): {parsed}"
     );
     assert!(
-        parsed["hint"]
-            .as_str()
-            .is_some_and(|h| h.contains("low") || h.contains("medium") || h.contains("high")),
+        parsed["hint"].as_str().map_or(false, |h| h.contains("low")
+            || h.contains("medium")
+            || h.contains("high")),
         "hint must mention valid values (#756): {parsed}"
     );
 
@@ -3017,7 +3012,7 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
         "missing --model value must be missing_flag_value (#756): {parsed2}"
     );
     assert!(
-        parsed2["hint"].as_str().is_some_and(|h| !h.is_empty()),
+        parsed2["hint"].as_str().map_or(false, |h| !h.is_empty()),
         "missing --model hint must be non-empty (#756): {parsed2}"
     );
 }
@@ -3261,7 +3256,7 @@ fn short_p_flag_swallows_no_flags_755() {
         "flag-like token after -p must be rejected as missing_prompt (#755): {parsed2}"
     );
     assert!(
-        parsed2["hint"].as_str().is_some_and(|h| !h.is_empty()),
+        parsed2["hint"].as_str().map_or(false, |h| !h.is_empty()),
         "missing_prompt hint must be non-empty (#755)"
     );
 }
@@ -3403,7 +3398,7 @@ fn config_unsupported_section_json_hint_741() {
         assert!(
             parsed["supported_sections"]
                 .as_array()
-                .is_some_and(|a| !a.is_empty()),
+                .map_or(false, |a| !a.is_empty()),
             "config {section} JSON must include supported_sections (#741)"
         );
     }
@@ -3460,7 +3455,7 @@ fn export_json_has_kind_702() {
     // On success stdout has kind:export; on failure stderr has type:error.
     // Either way, both envelopes must be valid JSON.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let _stderr = String::from_utf8_lossy(&output.stderr)
+    let stderr = String::from_utf8_lossy(&output.stderr)
         .lines()
         .filter(|l| l.starts_with('{'))
         .collect::<Vec<_>>()
@@ -3552,8 +3547,8 @@ fn config_parse_error_has_typed_error_kind_and_hint_764() {
         !output.status.success(),
         "malformed settings.json should cause non-zero exit"
     );
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json_line = stdout
         .lines()
@@ -3587,8 +3582,8 @@ fn login_logout_removed_subcommands_have_error_kind_and_hint_765() {
             !output.status.success(),
             "claw {subcmd} should exit non-zero"
         );
-        let _stdout = String::from_utf8_lossy(&output.stdout);
-        let _stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
             .lines()
@@ -3727,8 +3722,8 @@ fn resume_non_slash_trailing_arg_has_typed_error_kind_and_hint_768() {
         !output.status.success(),
         "claw --resume latest compact should exit non-zero"
     );
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json_line = stdout
         .lines()
@@ -3767,8 +3762,8 @@ fn session_with_unknown_subcommand_returns_interactive_only_not_credentials_767(
             !output.status.success(),
             "claw session {sub} should exit non-zero"
         );
-        let _stdout = String::from_utf8_lossy(&output.stdout);
-        let _stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
             .lines()
@@ -3821,7 +3816,7 @@ fn slash_only_verbs_with_args_return_interactive_only_not_credentials_770() {
             "claw {} should exit non-zero",
             args.join(" ")
         );
-        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
@@ -3863,8 +3858,8 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
     {
         let output = run_claw(&root, &["--output-format", "json", "agents", "bogus"], &[]);
         assert!(!output.status.success(), "agents bogus should fail");
-        let _stdout = String::from_utf8_lossy(&output.stdout);
-        let _stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
             .lines()
@@ -3887,8 +3882,8 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
     {
         let output = run_claw(&root, &["--output-format", "json", "plugins", "bogus"], &[]);
         assert!(!output.status.success(), "plugins bogus should fail");
-        let _stdout = String::from_utf8_lossy(&output.stdout);
-        let _stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
             .lines()
@@ -3907,7 +3902,7 @@ fn agents_plugins_mcp_unknown_subcommand_have_hint_774() {
     {
         let output = run_claw(&root, &["--output-format", "json", "mcp", "bogus"], &[]);
         assert!(!output.status.success(), "mcp bogus should fail");
-        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_str = if stdout.trim().starts_with('{') {
@@ -4022,7 +4017,7 @@ fn interactive_only_guard_batch_769_to_771() {
             "claw {} should exit non-zero",
             args.join(" ")
         );
-        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
@@ -4086,7 +4081,7 @@ fn resume_plugin_mutations_are_typed_interactive_only_777() {
             !output.status.success(),
             "/plugins {mutation} in resume mode should exit non-zero"
         );
-        let _stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json_line = stdout
@@ -4143,7 +4138,7 @@ fn resume_skills_invocation_is_typed_interactive_only_779() {
         !output.status.success(),
         "/skills <skill> in resume mode should exit non-zero"
     );
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json_line = stdout
@@ -4184,8 +4179,8 @@ fn acp_unsupported_invocation_has_hint_782() {
 
     let output = run_claw(&root, &["--output-format", "json", "acp", "start"], &[]);
     assert!(!output.status.success(), "acp start should fail");
-    let _stdout = String::from_utf8_lossy(&output.stdout);
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json_line = stdout
         .lines()
@@ -4222,7 +4217,7 @@ fn init_json_envelope_has_hint_and_already_initialized_783() {
     // Fresh init — already_initialized should be false, hint should mention CLAUDE.md
     let output = run_claw(&root, &["--output-format", "json", "init"], &[]);
     assert!(output.status.success(), "init should succeed");
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let raw = if stdout.trim_start().starts_with('{') {
@@ -4291,7 +4286,7 @@ fn init_json_envelope_has_hint_and_already_initialized_783() {
     // Idempotent re-init — already_initialized should be true
     let output2 = run_claw(&root, &["--output-format", "json", "init"], &[]);
     assert!(output2.status.success(), "re-init should succeed");
-    let _stdout2 = String::from_utf8_lossy(&output2.stdout);
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let raw2 = if stdout2.trim_start().starts_with('{') {
@@ -4372,7 +4367,7 @@ fn export_arg_errors_have_typed_kind_and_hint_784() {
         &[],
     );
     assert!(!out1.status.success(), "--output with no value should fail");
-    let _stderr1 = String::from_utf8_lossy(&out1.stderr);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let j1: serde_json::Value = stdout1
         .lines()
@@ -4399,7 +4394,7 @@ fn export_arg_errors_have_typed_kind_and_hint_784() {
         &[],
     );
     assert!(!out2.status.success(), "extra positional should fail");
-    let _stderr2 = String::from_utf8_lossy(&out2.stderr);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     let j2: serde_json::Value = stdout2
         .lines()
@@ -4436,7 +4431,7 @@ fn unknown_subcommand_returns_typed_kind_785() {
     // "dump" is close enough to "dump-manifests" to trigger the typo suggestion path
     let output = run_claw(&root, &["--output-format", "json", "dump"], &[]);
     assert!(!output.status.success(), "unknown subcommand should fail");
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let j: serde_json::Value = stdout
         .lines()
@@ -4484,7 +4479,7 @@ fn dump_manifests_missing_dir_has_typed_kind_and_hint_786() {
         &[],
     );
     assert!(!out1.status.success());
-    let _stderr1 = String::from_utf8_lossy(&out1.stderr);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let j1: serde_json::Value = stdout1
         .lines()
@@ -4516,7 +4511,7 @@ fn dump_manifests_missing_dir_has_typed_kind_and_hint_786() {
         &[],
     );
     assert!(!out2.status.success());
-    let _stderr2 = String::from_utf8_lossy(&out2.stderr);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     let j2: serde_json::Value = stdout2
         .lines()
@@ -4566,7 +4561,7 @@ fn resume_directory_path_returns_typed_kind_and_hint_787() {
         !output.status.success(),
         "resume with directory should fail"
     );
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let j: serde_json::Value = stdout
         .lines()
@@ -4616,7 +4611,7 @@ fn skills_show_not_found_emits_single_json_object_788() {
     assert!(!output.status.success(), "skills show unknown should fail");
     // Skills handler emits JSON to stdout; the duplicate was on stderr from the main error path.
     // After fix: stdout has 1 JSON object, stderr has none (no duplicate).
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -4778,7 +4773,7 @@ fn system_prompt_unknown_option_returns_typed_kind_790() {
         &[],
     );
     assert!(!out1.status.success());
-    let _stderr1 = String::from_utf8_lossy(&out1.stderr);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let j1: serde_json::Value = stdout1
         .lines()
@@ -4805,7 +4800,7 @@ fn system_prompt_unknown_option_returns_typed_kind_790() {
         &[],
     );
     assert!(!out2.status.success());
-    let _stderr2 = String::from_utf8_lossy(&out2.stderr);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     let j2: serde_json::Value = stdout2
         .lines()
@@ -4843,7 +4838,7 @@ fn config_extra_args_have_non_null_hint_791() {
         &[],
     );
     assert!(!out1.status.success());
-    let _stderr1 = String::from_utf8_lossy(&out1.stderr);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let j1: serde_json::Value = stdout1
         .lines()
@@ -4877,7 +4872,7 @@ fn config_extra_args_have_non_null_hint_791() {
         &[],
     );
     assert!(!out2.status.success());
-    let _stderr2 = String::from_utf8_lossy(&out2.stderr);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     let j2: serde_json::Value = stdout2
         .lines()
@@ -5063,7 +5058,7 @@ fn plugins_uninstall_not_found_has_hint_793() {
         "plugins uninstall not-found must exit non-zero (#793)"
     );
     // Error envelope goes to stderr (propagated via ? to main error handler)
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let j: serde_json::Value = stdout
         .lines()
@@ -5108,7 +5103,7 @@ fn plugins_install_not_found_path_returns_typed_kind_794() {
         !output.status.success(),
         "plugins install not-found-path must exit non-zero (#794)"
     );
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let j: serde_json::Value = stdout
         .lines()
@@ -5372,7 +5367,7 @@ fn agents_create_scaffolds_toml_and_lists_locally_431() {
         .iter()
         .any(|agent| {
             agent["name"] == "my-agent"
-                && Path::new(agent["path"].as_str().expect("listed agent path"))
+                && PathBuf::from(agent["path"].as_str().expect("listed agent path"))
                     == fs::canonicalize(&agent_path).expect("canonical listed agent path")
         }));
 }
@@ -5497,7 +5492,7 @@ fn plugins_extra_args_have_non_null_hint_797() {
         !output.status.success(),
         "plugins show with extra arg must exit non-zero (#797)"
     );
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let j: serde_json::Value = stdout
         .lines()
@@ -5563,7 +5558,7 @@ fn plugins_list_trailing_dash_text_error_stays_on_stderr_817() {
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stderr.contains("[error-kind: cli_parse]"), "{stderr}");
     assert!(
         stderr.contains("unknown option for `claw plugins list`: --"),
@@ -5588,7 +5583,7 @@ fn empty_prompt_has_non_null_hint_798() {
         !output.status.success(),
         "empty prompt must exit non-zero (#798)"
     );
-    let _stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let j: serde_json::Value = stdout
         .lines()
