@@ -14,9 +14,16 @@
 pub mod error;
 pub mod frame;
 pub mod registry;
+pub mod session;
 pub mod transport;
 
 pub use error::{SdkError, SdkErrorCode, SdkResult, SdkSentRecord};
 pub use frame::{FrameType, SdkFrame};
 pub use registry::{OperationMetadata, OperationRegistry, Schema};
+pub use session::{
+    InvocationOutcome, InvocationReconciliationStore, InvocationRecord, InvocationStatus,
+    RuntimeSessionRunner, SessionDispatch, SessionEvent, SessionEventStream, SessionEventType,
+    SessionInvocation, SessionPage, SessionRouter, SessionRunResult, SessionSummary,
+    SessionTurnRunner, TerminalScopeRecord, TerminalScopeStore,
+};
 pub use transport::{SdkClient, SdkClientConfig};

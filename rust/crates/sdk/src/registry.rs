@@ -263,6 +263,89 @@ impl OperationRegistry {
                 )),
         );
 
+        // SDK session lifecycle operations.
+        for (name, description, required) in [
+            (
+                "turn.create",
+                "Create a durable SDK session",
+                Vec::<&str>::new(),
+            ),
+            (
+                "turn.prompt",
+                "Prompt a session and stream lifecycle events",
+                Vec::<&str>::new(),
+            ),
+            (
+                "turn.steer",
+                "Steer an active session invocation",
+                vec!["invocationId"],
+            ),
+            (
+                "turn.abort_and_prompt",
+                "Abort the active invocation and start a replacement prompt",
+                Vec::<&str>::new(),
+            ),
+            (
+                "turn.list",
+                "List persisted SDK sessions",
+                Vec::<&str>::new(),
+            ),
+        ] {
+            let mut properties = serde_json::Map::new();
+            properties.insert("sessionId".to_string(), json!({ "type": "string" }));
+            properties.insert("correlationKey".to_string(), json!({ "type": "string" }));
+            properties.insert("invocationId".to_string(), json!({ "type": "string" }));
+            properties.insert("prompt".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "override".to_string(),
+                json!({ "type": ["string", "object", "array"] }),
+            );
+            properties.insert(
+                "request".to_string(),
+                json!({ "type": ["string", "object", "array"] }),
+            );
+            properties.insert(
+                "input".to_string(),
+                json!({ "type": ["string", "object", "array"] }),
+            );
+            properties.insert("tools".to_string(), json!({ "type": "array" }));
+            properties.insert("settings".to_string(), json!({ "type": "object" }));
+            properties.insert("model".to_string(), json!({ "type": "string" }));
+            properties.insert("cursor".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "limit".to_string(),
+                json!({ "type": "integer", "minimum": 1 }),
+            );
+            let mut input_schema = json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            });
+            let prompt_alternatives = json!([
+                { "required": ["prompt"] },
+                { "required": ["request"] },
+                { "required": ["input"] },
+            ]);
+            match name {
+                "turn.prompt" | "turn.abort_and_prompt" => {
+                    input_schema["anyOf"] = prompt_alternatives;
+                }
+                "turn.steer" => {
+                    input_schema["anyOf"] = json!([
+                        { "required": ["override"] },
+                        { "required": ["prompt"] },
+                        { "required": ["request"] },
+                        { "required": ["input"] },
+                    ]);
+                }
+                _ => {}
+            }
+            registry.register(
+                OperationMetadata::new(name, description)
+                    .with_input_schema(Schema::new(format!("Input for {name}"), input_schema)),
+            );
+        }
+
         registry
     }
 
@@ -395,6 +478,20 @@ mod tests {
     fn standard_registry_has_event_operations() {
         let registry = OperationRegistry::with_standard_operations();
         assert!(registry.has_operation("events.replay"));
+    }
+
+    #[test]
+    fn standard_registry_has_session_lifecycle_operations() {
+        let registry = OperationRegistry::with_standard_operations();
+        for operation in [
+            "turn.create",
+            "turn.prompt",
+            "turn.steer",
+            "turn.abort_and_prompt",
+            "turn.list",
+        ] {
+            assert!(registry.has_operation(operation), "missing {operation}");
+        }
     }
 
     #[test]

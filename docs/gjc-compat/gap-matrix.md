@@ -161,52 +161,52 @@ GJC sessions have **three entry points**:
 
 ### claw-code Status
 
-**Current** (as of PR #3330): Partial. SDK transport merged (see SDK Wire Protocol). Local session lifecycle exists in `runtime::Session`. Remaining: operation handlers, session router with durable lookup, invocation reconciliation store, terminal scope tracking.
+**Current**: The SDK now exposes `sdk::session::SessionRouter` with durable `turn.create`, `turn.prompt`, `turn.steer`, `turn.abort_and_prompt`, and paginated `turn.list` handling. It bridges `runtime::Session`/`ConversationRuntime`, streams ordered lifecycle events, persists invocation outcomes for reconciliation, and stores terminal session scope by correlation key. The WebSocket transport remains a client transport; a remotely hosted broker and automatic recovery of an unknown post-crash outcome remain outside this slice.
 
 **Files**:
 - `rust/crates/runtime/src/session.rs` (1,961 LOC)
-- `rust/crates/runtime/src/conversation.rs` (1,878 LOC)
+- `rust/crates/runtime/src/conversation.rs` (conversation loop and lifecycle event bridge)
 - `rust/crates/runtime/src/session_control.rs` (file ops, migration)
 - `rust/crates/runtime/src/lib.rs` (re-exports `Session`, `SessionStore`, `ConversationRuntime`)
+- `rust/crates/sdk/src/session/` (router, event stream, reconciliation, terminal scope)
 
 **Lines**: ~3,900 LOC (session + conversation)
 
 **Reality**:
-- `Session` struct holds in-memory state (messages, usage, context).
-- `SessionStore` reads/writes `.claw/sessions/{id}/` directory.
-- `ConversationRuntime` drives the local agent loop (sync).
-- No WebSocket or remote access.
-- No invocation reconciliation or uncertain outcome recovery.
-- No terminal scope tracking (per-session-per-correlation).
+- `Session` holds persisted conversation state and `SessionStore` resolves session IDs in the workspace namespace.
+- `ConversationRuntime` drives the local agent loop and emits lifecycle events to an optional callback.
+- `sdk::session::SessionRouter` dispatches the five turn operations and exposes a per-invocation event stream.
+- Invocation terminal outcomes and correlation-key terminal scopes are durable; startup recovery marks unfinished invocations uncertain for later reconciliation.
+- A remote WebSocket server/broker and inference of an outcome that was never durably recorded are still absent.
 
 ### Gap Assessment
 
 | Component | GJC | claw-code | Gap | Complexity |
 |-----------|-----|-----------|-----|------------|
-| Remote Session Router | 2,500 LOC | — | 100% | High |
-| Invocation Reconciliation | 1,200 LOC | — | 100% | High |
-| Terminal Scope Tracking | 600 LOC | — | 100% | Medium |
-| Async Event Streaming | 800 LOC | Partial | 60% | Medium |
-| Uncertain Outcome Recovery | 1,000 LOC | — | 100% | High |
-| **Total** | **6,100 LOC** | **3,900** | **2,200 LOC** | — |
+| Remote Session Router | 2,500 LOC | Local router/dispatch | Partial | High |
+| Invocation Reconciliation | 1,200 LOC | Durable invocation records | Partial | High |
+| Terminal Scope Tracking | 600 LOC | Implemented | — | Medium |
+| Async Event Streaming | 800 LOC | Local per-invocation stream | Partial | Medium |
+| Uncertain Outcome Recovery | 1,000 LOC | Unfinished records recovered as uncertain | Partial | High |
+| **Total** | **6,100 LOC** | **Session lifecycle slice implemented** | **Remote broker remains** | — |
 
 ### Proposed Implementation
 
 **Owner Crate**: `sdk` (new, or extend `runtime`)
 
-**Module Structure** (add to `sdk/session/`):
+**Module Structure** (`sdk/session/`):
 ```
 sdk/session/
-├── router.rs            (session routing, durable lookup)
+├── mod.rs                (session routing and operation dispatch)
 ├── reconciliation.rs    (uncertain → terminal recovery)
 ├── terminal_scope.rs    (per-correlation state retention)
-└── events.rs            (event publishing, reconciliation)
+└── events.rs            (ordered lifecycle event types)
 ```
 
 **Integration Points**:
-- Bridge `runtime::Session` into `sdk::Session` wrapper
-- Add `runtime::SessionStore` extensions for reconciliation data
-- Extend `ConversationRuntime` with event emission
+- Bridge `runtime::Session` and `ConversationRuntime` into SDK lifecycle operations
+- Persist reconciliation and terminal-scope data alongside the session namespace
+- Emit lifecycle callbacks from `ConversationRuntime`
 
 **Size Estimate**: 2,500 LOC (Rust, new + modifications)
 

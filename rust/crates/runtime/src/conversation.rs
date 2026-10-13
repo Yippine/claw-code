@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 use serde_json::{Map, Value};
@@ -47,6 +47,29 @@ pub enum AssistantEvent {
     MessageStop,
 }
 
+/// Runtime lifecycle event emitted while processing a conversation turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationEvent {
+    AgentBegin {
+        session_id: String,
+    },
+    ToolUse {
+        tool_use_id: String,
+        tool_name: String,
+        input: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        tool_name: String,
+        output: String,
+        is_error: bool,
+    },
+    AgentEnd {
+        session_id: String,
+        interrupted: bool,
+    },
+}
+
 /// Prompt-cache telemetry captured from the provider response stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptCacheEvent {
@@ -89,6 +112,103 @@ impl TurnInterruptSignal {
 
     pub fn reset(&self) {
         self.interrupted.store(false, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Default)]
+struct TurnControlState {
+    queued_steers: VecDeque<String>,
+    closed: bool,
+    aborted: bool,
+}
+
+/// Shared steering and abort control for a running conversation turn.
+///
+/// Clones share one queue and lifecycle state. Steering is accepted until
+/// `finish_or_take_steer` closes the signal or `abort` is called.
+#[derive(Debug, Clone, Default)]
+pub struct TurnControlSignal {
+    state: Arc<Mutex<TurnControlState>>,
+}
+
+impl TurnControlSignal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a steering prompt while the signal is accepting input.
+    pub fn steer(&self, prompt: impl Into<String>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed || state.aborted {
+            return false;
+        }
+        state.queued_steers.push_back(prompt.into());
+        true
+    }
+
+    /// Remove one queued steering prompt, if present.
+    #[must_use]
+    pub fn take_steer(&self) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.aborted {
+            return None;
+        }
+        state.queued_steers.pop_front()
+    }
+
+    /// Drain one queued prompt, or atomically close the signal when empty.
+    #[must_use]
+    pub fn finish_or_take_steer(&self) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.aborted {
+            state.queued_steers.clear();
+            state.closed = true;
+            return None;
+        }
+        if let Some(prompt) = state.queued_steers.pop_front() {
+            return Some(prompt);
+        }
+        state.closed = true;
+        None
+    }
+
+    /// Abort the active turn and reject further steering prompts.
+    pub fn abort(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.aborted = true;
+        state.closed = true;
+        state.queued_steers.clear();
+    }
+
+    /// Close steering without classifying the turn as aborted.
+    pub fn close(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        state.queued_steers.clear();
+    }
+
+    #[must_use]
+    pub fn is_aborted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .aborted
     }
 }
 
@@ -179,6 +299,8 @@ pub struct ConversationRuntime<C, T> {
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
     turn_interrupt_signal: TurnInterruptSignal,
+    turn_control_signal: Option<TurnControlSignal>,
+    event_callback: Option<Arc<dyn Fn(ConversationEvent) + Send + Sync>>,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
 }
@@ -234,6 +356,8 @@ where
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             turn_interrupt_signal: TurnInterruptSignal::default(),
+            turn_control_signal: None,
+            event_callback: None,
             hook_progress_reporter: None,
             session_tracer: None,
         }
@@ -270,6 +394,21 @@ where
         turn_interrupt_signal: TurnInterruptSignal,
     ) -> Self {
         self.turn_interrupt_signal = turn_interrupt_signal;
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_callback(
+        mut self,
+        callback: Arc<dyn Fn(ConversationEvent) + Send + Sync>,
+    ) -> Self {
+        self.event_callback = Some(callback);
+        self
+    }
+
+    #[must_use]
+    pub fn with_turn_control_signal(mut self, turn_control_signal: TurnControlSignal) -> Self {
+        self.turn_control_signal = Some(turn_control_signal);
         self
     }
 
@@ -377,6 +516,58 @@ where
         }
     }
 
+    fn emit_conversation_event(&self, event: ConversationEvent) {
+        if let Some(callback) = &self.event_callback {
+            callback(event);
+        }
+    }
+
+    fn turn_control_is_aborted(&self) -> bool {
+        let is_aborted = self
+            .turn_control_signal
+            .as_ref()
+            .is_some_and(TurnControlSignal::is_aborted);
+        if is_aborted {
+            self.turn_interrupt_signal.interrupt();
+        }
+        is_aborted
+    }
+
+    fn turn_is_interrupted(&self) -> bool {
+        self.turn_control_is_aborted() || self.turn_interrupt_signal.is_interrupted()
+    }
+
+    fn append_queued_steer(&mut self) -> Result<bool, RuntimeError> {
+        let Some(prompt) = self
+            .turn_control_signal
+            .as_ref()
+            .and_then(TurnControlSignal::take_steer)
+        else {
+            return Ok(false);
+        };
+        self.session
+            .push_user_text(prompt)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn emit_tool_result_event(&self, message: &ConversationMessage) {
+        if let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        }) = message.blocks.first()
+        {
+            self.emit_conversation_event(ConversationEvent::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                tool_name: tool_name.clone(),
+                output: output.clone(),
+                is_error: *is_error,
+            });
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -384,246 +575,292 @@ where
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
-
-        // ROADMAP #38: Session-health canary - probe if context was compacted
-        if self.session.compaction.is_some() {
-            if let Err(error) = self.run_session_health_probe() {
-                return Err(RuntimeError::new(format!(
-                    "Session health probe failed after compaction: {error}. \
+        let session_id = self.session.session_id.clone();
+        self.emit_conversation_event(ConversationEvent::AgentBegin {
+            session_id: session_id.clone(),
+        });
+        let mut interrupted = false;
+        let outcome = (|| {
+            // ROADMAP #38: Session-health canary - probe if context was compacted
+            if self.session.compaction.is_some() {
+                if let Err(error) = self.run_session_health_probe() {
+                    return Err(RuntimeError::new(format!(
+                        "Session health probe failed after compaction: {error}. \
                      The session may be in an inconsistent state. \
                      Consider starting a fresh session with /session new."
-                )));
-            }
-        }
-
-        self.record_turn_started(&user_input);
-        self.session
-            .push_user_text(user_input)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-
-        let mut assistant_messages = Vec::new();
-        let mut tool_results = Vec::new();
-        let mut prompt_cache_events = Vec::new();
-        let mut iterations = 0;
-        let mut auto_compaction = None;
-        let mut interrupted = false;
-
-        loop {
-            if self.turn_interrupt_signal.is_interrupted() {
-                self.record_turn_interrupted(iterations, "before_request");
-                interrupted = true;
-                break;
-            }
-            iterations += 1;
-            if iterations > self.max_iterations {
-                let error = RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
-                );
-                self.record_turn_failed(iterations, &error);
-                return Err(error);
+                    )));
+                }
             }
 
-            let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
-            };
-            let events = match self.api_client.stream(request) {
-                Ok(events) => events,
-                Err(error) => {
-                    if self.turn_interrupt_signal.is_interrupted() {
-                        // The client aborted because the user interrupted the
-                        // turn; any partial response is discarded and the stop
-                        // is reported as an interruption rather than a failure.
-                        self.record_turn_interrupted(iterations, "during_request");
-                        interrupted = true;
-                        break;
-                    }
+            self.record_turn_started(&user_input);
+            self.session
+                .push_user_text(user_input)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+            let mut assistant_messages = Vec::new();
+            let mut tool_results = Vec::new();
+            let mut prompt_cache_events = Vec::new();
+            let mut iterations = 0;
+            let mut auto_compaction = None;
+
+            loop {
+                if self.turn_is_interrupted() {
+                    self.record_turn_interrupted(iterations, "before_request");
+                    interrupted = true;
+                    break;
+                }
+                iterations += 1;
+                if iterations > self.max_iterations {
+                    let error = RuntimeError::new(
+                        "conversation loop exceeded the maximum number of iterations",
+                    );
                     self.record_turn_failed(iterations, &error);
                     return Err(error);
                 }
-            };
-            let (assistant_message, usage, turn_prompt_cache_events) =
-                match build_assistant_message(events) {
-                    Ok(result) => result,
+
+                let request = ApiRequest {
+                    system_prompt: self.system_prompt.clone(),
+                    messages: self.session.messages.clone(),
+                };
+                let events = match self.api_client.stream(request) {
+                    Ok(events) => events,
                     Err(error) => {
+                        if self.turn_is_interrupted() {
+                            // The client aborted because the user interrupted the
+                            // turn; any partial response is discarded and the stop
+                            // is reported as an interruption rather than a failure.
+                            self.record_turn_interrupted(iterations, "during_request");
+                            interrupted = true;
+                            break;
+                        }
                         self.record_turn_failed(iterations, &error);
                         return Err(error);
                     }
                 };
-            if let Some(usage) = usage {
-                self.usage_tracker.record(usage);
-            }
-            prompt_cache_events.extend(turn_prompt_cache_events);
-            let pending_tool_uses = assistant_message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
+                let (assistant_message, usage, turn_prompt_cache_events) =
+                    match build_assistant_message(events) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.record_turn_failed(iterations, &error);
+                            return Err(error);
+                        }
+                    };
+                if let Some(usage) = usage {
+                    self.usage_tracker.record(usage);
+                }
+                prompt_cache_events.extend(turn_prompt_cache_events);
+                let pending_tool_uses = assistant_message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolUse { id, name, input } => {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                self.record_assistant_iteration(
+                    iterations,
+                    &assistant_message,
+                    pending_tool_uses.len(),
+                );
+
+                self.session
+                    .push_message(assistant_message.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                assistant_messages.push(assistant_message);
+
+                // Run auto-compaction check before next API call, including on the terminal
+                // (no-tool) iteration, to prevent unbounded session growth (#3106).
+                if let Some(compaction) = self.maybe_auto_compact() {
+                    auto_compaction = Some(compaction);
+                }
+
+                if pending_tool_uses.is_empty() {
+                    if self.turn_control_is_aborted() {
+                        self.record_turn_interrupted(iterations, "after_request");
+                        interrupted = true;
+                        break;
                     }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            self.record_assistant_iteration(
-                iterations,
-                &assistant_message,
-                pending_tool_uses.len(),
-            );
-
-            self.session
-                .push_message(assistant_message.clone())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            assistant_messages.push(assistant_message);
-
-            // Run auto-compaction check before next API call, including on the terminal
-            // (no-tool) iteration, to prevent unbounded session growth (#3106).
-            if let Some(compaction) = self.maybe_auto_compact() {
-                auto_compaction = Some(compaction);
-            }
-
-            if pending_tool_uses.is_empty() {
-                break;
-            }
-
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
-                if interrupted || self.turn_interrupt_signal.is_interrupted() {
-                    // Every pending tool_use must still receive a tool_result
-                    // so the session stays valid for the next request.
-                    if !interrupted {
-                        self.record_turn_interrupted(iterations, "before_tool");
+                    if self.append_queued_steer()? {
+                        continue;
+                    }
+                    if self.turn_control_is_aborted() {
+                        self.record_turn_interrupted(iterations, "after_request");
                         interrupted = true;
                     }
-                    let result_message = ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        "Interrupted by user before this tool could run.",
-                        true,
+                    break;
+                }
+
+                for (tool_use_id, tool_name, input) in pending_tool_uses {
+                    self.emit_conversation_event(ConversationEvent::ToolUse {
+                        tool_use_id: tool_use_id.clone(),
+                        tool_name: tool_name.clone(),
+                        input: input.clone(),
+                    });
+                    if interrupted || self.turn_is_interrupted() {
+                        // Every pending tool_use must still receive a tool_result
+                        // so the session stays valid for the next request.
+                        if !interrupted {
+                            self.record_turn_interrupted(iterations, "before_tool");
+                            interrupted = true;
+                        }
+                        let result_message = ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            "Interrupted by user before this tool could run.",
+                            true,
+                        );
+                        self.session
+                            .push_message(result_message.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.emit_tool_result_event(&result_message);
+                        tool_results.push(result_message);
+                        continue;
+                    }
+                    let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+                    let effective_input = pre_hook_result
+                        .updated_input()
+                        .map_or_else(|| input.clone(), ToOwned::to_owned);
+                    let permission_context = PermissionContext::new(
+                        pre_hook_result.permission_override(),
+                        pre_hook_result.permission_reason().map(ToOwned::to_owned),
                     );
+
+                    let permission_outcome = if pre_hook_result.is_cancelled() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook cancelled tool `{tool_name}`"),
+                            ),
+                        }
+                    } else if pre_hook_result.is_failed() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook failed for tool `{tool_name}`"),
+                            ),
+                        }
+                    } else if pre_hook_result.is_denied() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook denied tool `{tool_name}`"),
+                            ),
+                        }
+                    } else if let Some(prompt) = prompter.as_mut() {
+                        self.permission_policy.authorize_with_context(
+                            &tool_name,
+                            &effective_input,
+                            &permission_context,
+                            Some(*prompt),
+                        )
+                    } else {
+                        self.permission_policy.authorize_with_context(
+                            &tool_name,
+                            &effective_input,
+                            &permission_context,
+                            None,
+                        )
+                    };
+
+                    let result_message = match permission_outcome {
+                        PermissionOutcome::Allow => {
+                            self.record_tool_started(iterations, &tool_name);
+                            let (mut output, mut is_error) =
+                                match self.tool_executor.execute(&tool_name, &effective_input) {
+                                    Ok(output) => (output, false),
+                                    Err(error) => (error.to_string(), true),
+                                };
+                            output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+
+                            let post_hook_result = if is_error {
+                                self.run_post_tool_use_failure_hook(
+                                    &tool_name,
+                                    &effective_input,
+                                    &output,
+                                )
+                            } else {
+                                self.run_post_tool_use_hook(
+                                    &tool_name,
+                                    &effective_input,
+                                    &output,
+                                    false,
+                                )
+                            };
+                            if post_hook_result.is_denied()
+                                || post_hook_result.is_failed()
+                                || post_hook_result.is_cancelled()
+                            {
+                                is_error = true;
+                            }
+                            output = merge_hook_feedback(
+                                post_hook_result.messages(),
+                                output,
+                                post_hook_result.is_denied()
+                                    || post_hook_result.is_failed()
+                                    || post_hook_result.is_cancelled(),
+                            );
+
+                            ConversationMessage::tool_result(
+                                tool_use_id,
+                                tool_name,
+                                output,
+                                is_error,
+                            )
+                        }
+                        PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                            true,
+                        ),
+                    };
                     self.session
                         .push_message(result_message.clone())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.emit_tool_result_event(&result_message);
+                    self.record_tool_finished(iterations, &result_message);
                     tool_results.push(result_message);
+                }
+
+                if !interrupted && self.turn_control_is_aborted() {
+                    self.record_turn_interrupted(iterations, "after_tool");
+                    interrupted = true;
+                }
+                if interrupted {
+                    break;
+                }
+                if self.append_queued_steer()? {
                     continue;
                 }
-                let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
-                let effective_input = pre_hook_result
-                    .updated_input()
-                    .map_or_else(|| input.clone(), ToOwned::to_owned);
-                let permission_context = PermissionContext::new(
-                    pre_hook_result.permission_override(),
-                    pre_hook_result.permission_reason().map(ToOwned::to_owned),
-                );
-
-                let permission_outcome = if pre_hook_result.is_cancelled() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                        ),
-                    }
-                } else if pre_hook_result.is_failed() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook failed for tool `{tool_name}`"),
-                        ),
-                    }
-                } else if pre_hook_result.is_denied() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook denied tool `{tool_name}`"),
-                        ),
-                    }
-                } else if let Some(prompt) = prompter.as_mut() {
-                    self.permission_policy.authorize_with_context(
-                        &tool_name,
-                        &effective_input,
-                        &permission_context,
-                        Some(*prompt),
-                    )
-                } else {
-                    self.permission_policy.authorize_with_context(
-                        &tool_name,
-                        &effective_input,
-                        &permission_context,
-                        None,
-                    )
-                };
-
-                let result_message = match permission_outcome {
-                    PermissionOutcome::Allow => {
-                        self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
-                        output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                        let post_hook_result = if is_error {
-                            self.run_post_tool_use_failure_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                            )
-                        } else {
-                            self.run_post_tool_use_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                                false,
-                            )
-                        };
-                        if post_hook_result.is_denied()
-                            || post_hook_result.is_failed()
-                            || post_hook_result.is_cancelled()
-                        {
-                            is_error = true;
-                        }
-                        output = merge_hook_feedback(
-                            post_hook_result.messages(),
-                            output,
-                            post_hook_result.is_denied()
-                                || post_hook_result.is_failed()
-                                || post_hook_result.is_cancelled(),
-                        );
-
-                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
-                    }
-                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                        true,
-                    ),
-                };
-                self.session
-                    .push_message(result_message.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_tool_finished(iterations, &result_message);
-                tool_results.push(result_message);
+                if self.turn_control_is_aborted() {
+                    self.record_turn_interrupted(iterations, "after_tool");
+                    interrupted = true;
+                    break;
+                }
             }
 
-            if interrupted {
-                break;
+            let summary = TurnSummary {
+                assistant_messages,
+                tool_results,
+                prompt_cache_events,
+                iterations,
+                usage: self.usage_tracker.cumulative_usage(),
+                auto_compaction,
+                interrupted,
+            };
+            if !interrupted {
+                self.record_turn_completed(&summary);
             }
-        }
 
-        let summary = TurnSummary {
-            assistant_messages,
-            tool_results,
-            prompt_cache_events,
-            iterations,
-            usage: self.usage_tracker.cumulative_usage(),
-            auto_compaction,
+            Ok(summary)
+        })();
+        self.emit_conversation_event(ConversationEvent::AgentEnd {
+            session_id,
             interrupted,
-        };
-        if !interrupted {
-            self.record_turn_completed(&summary);
-        }
-
-        Ok(summary)
+        });
+        outcome
     }
 
     #[must_use]
@@ -956,9 +1193,9 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, TurnInterruptSignal,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        AssistantEvent, AutoCompactionEvent, ConversationEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor, TurnControlSignal,
+        TurnInterruptSignal, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -972,7 +1209,7 @@ mod tests {
     use crate::ToolError;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -1043,6 +1280,219 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    #[test]
+    fn emits_ordered_lifecycle_events_for_tool_calls() {
+        struct ToolThenDoneApi {
+            calls: usize,
+        }
+
+        impl ApiClient for ToolThenDoneApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-event-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "payload".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ])
+                } else {
+                    Ok(vec![
+                        AssistantEvent::TextDelta("done".to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
+            }
+        }
+
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let captured_events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&captured_events);
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ToolThenDoneApi { calls: 0 },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_event_callback(Arc::new(move |event| {
+            callback_events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .push(event);
+        }));
+
+        runtime
+            .run_turn("start", None)
+            .expect("tool turn should complete");
+
+        assert_eq!(
+            *captured_events
+                .lock()
+                .expect("event mutex should not be poisoned"),
+            vec![
+                ConversationEvent::AgentBegin {
+                    session_id: session_id.clone(),
+                },
+                ConversationEvent::ToolUse {
+                    tool_use_id: "tool-event-1".to_string(),
+                    tool_name: "echo".to_string(),
+                    input: "payload".to_string(),
+                },
+                ConversationEvent::ToolResult {
+                    tool_use_id: "tool-event-1".to_string(),
+                    tool_name: "echo".to_string(),
+                    output: "payload".to_string(),
+                    is_error: false,
+                },
+                ConversationEvent::AgentEnd {
+                    session_id,
+                    interrupted: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn consumes_steering_queued_during_a_model_request_and_preserves_late_steers() {
+        struct SteeringApi {
+            control: TurnControlSignal,
+            calls: usize,
+        }
+
+        impl ApiClient for SteeringApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    // Queue from another thread while this model request is
+                    // still inside `stream`.
+                    let control = self.control.clone();
+                    assert!(std::thread::spawn(move || control.steer("follow-up"))
+                        .join()
+                        .expect("steering thread should finish"));
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "steer-tool".to_string(),
+                            name: "echo".to_string(),
+                            input: "tool input".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                if self.calls == 2 {
+                    assert!(request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::Tool));
+                    assert!(request.messages.iter().any(|message| {
+                        message.role == MessageRole::User
+                            && message.blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text } if text == "follow-up")
+                            })
+                    }));
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("second response".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                unreachable!("the queued steer should only cause one extra request")
+            }
+        }
+
+        let control = TurnControlSignal::new();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SteeringApi {
+                control: control.clone(),
+                calls: 0,
+            },
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_turn_control_signal(control.clone());
+
+        let summary = runtime
+            .run_turn("start", None)
+            .expect("steering turn should complete");
+
+        assert_eq!(summary.iterations, 2);
+        assert!(runtime.session().messages.iter().any(|message| {
+            message.role == MessageRole::User
+                && message.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "follow-up"),
+                )
+        }));
+        assert!(control.steer("late steer"));
+        assert_eq!(
+            control.finish_or_take_steer().as_deref(),
+            Some("late steer")
+        );
+        assert_eq!(control.finish_or_take_steer(), None);
+        assert!(!control.steer("rejected after finish"));
+    }
+
+    #[test]
+    fn aborting_turn_control_uses_existing_interrupted_outcome() {
+        struct AbortApi {
+            control: TurnControlSignal,
+        }
+
+        impl ApiClient for AbortApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.control.abort();
+                Err(RuntimeError::new("request aborted"))
+            }
+        }
+
+        let control = TurnControlSignal::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&events);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AbortApi {
+                control: control.clone(),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_turn_control_signal(control.clone())
+        .with_event_callback(Arc::new(move |event| {
+            callback_events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .push(event);
+        }));
+
+        let summary = runtime
+            .run_turn("start", None)
+            .expect("control abort should be reported as an interruption");
+
+        assert!(summary.interrupted);
+        assert!(control.is_aborted());
+        assert!(!control.steer("too late"));
+        assert!(matches!(
+            events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .last(),
+            Some(ConversationEvent::AgentEnd {
+                interrupted: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2127,8 +2577,12 @@ mod tests {
 
         // given
         let interrupt = TurnInterruptSignal::new();
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let captured_events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = Arc::clone(&captured_events);
         let mut runtime = ConversationRuntime::new(
-            Session::new(),
+            session,
             ToolUseApi {
                 interrupt: interrupt.clone(),
             },
@@ -2137,7 +2591,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_turn_interrupt_signal(interrupt);
+        .with_turn_interrupt_signal(interrupt)
+        .with_event_callback(Arc::new(move |event| {
+            callback_events
+                .lock()
+                .expect("event mutex should not be poisoned")
+                .push(event);
+        }));
 
         // when
         let summary = runtime
@@ -2164,6 +2624,31 @@ mod tests {
             runtime.session().messages[2].blocks[0],
             ContentBlock::ToolResult { is_error: true, .. }
         ));
+        assert_eq!(
+            *captured_events
+                .lock()
+                .expect("event mutex should not be poisoned"),
+            vec![
+                ConversationEvent::AgentBegin {
+                    session_id: session_id.clone(),
+                },
+                ConversationEvent::ToolUse {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "add".to_string(),
+                    input: "2,2".to_string(),
+                },
+                ConversationEvent::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "add".to_string(),
+                    output: "Interrupted by user before this tool could run.".to_string(),
+                    is_error: true,
+                },
+                ConversationEvent::AgentEnd {
+                    session_id,
+                    interrupted: true,
+                },
+            ]
+        );
     }
 
     #[test]

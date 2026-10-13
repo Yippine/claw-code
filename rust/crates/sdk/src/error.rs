@@ -15,6 +15,8 @@ pub enum SdkErrorCode {
     Unauthorized,
     EndpointCredentialForbidden,
     Unavailable,
+    /// Requested session state conflicts with an active invocation
+    Conflict,
     ConnectionError,
     ConnectionClosed,
     Timeout,
@@ -37,6 +39,7 @@ impl SdkErrorCode {
             Self::Unauthorized => "unauthorized",
             Self::EndpointCredentialForbidden => "endpoint_credential_forbidden",
             Self::Unavailable => "unavailable",
+            Self::Conflict => "conflict",
             Self::ConnectionError => "connection_error",
             Self::ConnectionClosed => "connection_closed",
             Self::Timeout => "timeout",
@@ -59,6 +62,7 @@ impl SdkErrorCode {
             "unauthorized" => Self::Unauthorized,
             "endpoint_credential_forbidden" => Self::EndpointCredentialForbidden,
             "unavailable" => Self::Unavailable,
+            "conflict" => Self::Conflict,
             "connection_error" => Self::ConnectionError,
             "connection_closed" => Self::ConnectionClosed,
             "timeout" => Self::Timeout,
@@ -130,6 +134,14 @@ impl SdkError {
 
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(SdkErrorCode::Unavailable, message)
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(SdkErrorCode::NotFound, message)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(SdkErrorCode::Conflict, message)
     }
 
     pub fn connection_error(message: impl Into<String>) -> Self {
@@ -207,6 +219,13 @@ mod tests {
             SdkErrorCode::UncertainAfterSend.to_string(),
             "uncertain_after_send"
         );
+    }
+
+    #[test]
+    fn conflict_error_code_round_trips_on_the_wire() {
+        let error = SdkError::conflict("session is active");
+        assert_eq!(error.code.to_string(), "conflict");
+        assert_eq!(SdkErrorCode::from_wire("conflict"), SdkErrorCode::Conflict);
     }
 
     #[test]
