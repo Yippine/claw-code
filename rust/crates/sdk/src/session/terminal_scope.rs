@@ -59,7 +59,7 @@ impl TerminalScopeStore {
             correlation_key: correlation_key.clone(),
             session_id: session_id.into(),
             revision,
-            updated_at_ms: current_timestamp_ms().max(previous_updated_at),
+            updated_at_ms: current_timestamp_ms().max(previous_updated_at.saturating_add(1)),
         };
         atomic_write_json(&self.record_path(&correlation_key), &record)?;
         Ok(record)
@@ -93,8 +93,11 @@ impl TerminalScopeStore {
             correlation_key: correlation_key.to_string(),
             session_id: session_id.to_string(),
             revision,
-            updated_at_ms: current_timestamp_ms()
-                .max(previous.map_or(0, |record| record.updated_at_ms)),
+            updated_at_ms: current_timestamp_ms().max(
+                previous
+                    .map_or(0, |record| record.updated_at_ms)
+                    .saturating_add(1),
+            ),
         };
         atomic_write_json(&self.record_path(correlation_key), &record)
     }
@@ -217,6 +220,7 @@ mod tests {
         let first = store.set("request-1", "session-1").unwrap();
         let second = store.set("request-1", "session-2").unwrap();
         assert_eq!(second.revision, first.revision + 1);
+        assert!(second.updated_at_ms > first.updated_at_ms);
 
         store
             .restore_if_newer("request-1", "session-1", first.revision)

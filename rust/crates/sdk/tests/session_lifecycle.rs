@@ -48,6 +48,7 @@ impl SessionTurnRunner for EchoRunner {
         callback(ConversationEvent::AgentEnd {
             session_id,
             interrupted: false,
+            output: None,
         });
         SessionRunResult::Completed(session)
     }
@@ -132,6 +133,7 @@ impl SessionTurnRunner for GateRunner {
         callback(ConversationEvent::AgentEnd {
             session_id,
             interrupted: false,
+            output: None,
         });
         SessionRunResult::Completed(session)
     }
@@ -161,6 +163,7 @@ impl SessionTurnRunner for AbortRunner {
             callback(ConversationEvent::AgentEnd {
                 session_id,
                 interrupted: true,
+                output: None,
             });
             return SessionRunResult::Aborted(session);
         }
@@ -173,6 +176,7 @@ impl SessionTurnRunner for AbortRunner {
         callback(ConversationEvent::AgentEnd {
             session_id,
             interrupted: false,
+            output: None,
         });
         SessionRunResult::Completed(session)
     }
@@ -944,7 +948,7 @@ fn terminal_scope_survives_router_restart() {
 }
 
 #[tokio::test]
-async fn terminal_scope_write_failure_keeps_outcome_uncertain_and_blocks_stale_routing() {
+async fn terminal_scope_write_failure_preserves_outcome_for_reconciliation() {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let runner = Arc::new(GateRunner {
@@ -970,11 +974,34 @@ async fn terminal_scope_write_failure_keeps_outcome_uncertain_and_blocks_stale_r
         events.last().unwrap().event_type,
         SessionEventType::AgentEnd
     );
+    let reconciliation = sdk::InvocationReconciliationStore::new(
+        store.sessions_dir().join("sdk").join("reconciliation"),
+    );
+    let pending = reconciliation
+        .get(&invocation_id)
+        .unwrap()
+        .expect("pending result should be durable");
+    assert_eq!(pending.status, InvocationStatus::Uncertain);
     assert_eq!(
-        router.reconcile(&invocation_id).unwrap().status,
-        InvocationStatus::Uncertain
+        pending.outcome,
+        Some(InvocationOutcome::Completed { message_count: 1 })
+    );
+    assert_eq!(
+        pending.terminal_event.as_ref().unwrap()["eventType"],
+        "turn_ended"
     );
     assert!(router.session_for_correlation_key("repair-key").is_err());
+
+    std::fs::remove_file(&scope_root).unwrap();
+    std::fs::create_dir_all(&scope_root).unwrap();
+    drop(router);
+    let restarted = SessionRouter::new(store, Arc::new(EchoRunner)).unwrap();
+    let recovered = restarted.reconcile(&invocation_id).unwrap();
+    assert_eq!(recovered.status, InvocationStatus::Terminal);
+    assert_eq!(
+        restarted.session_for_correlation_key("repair-key").unwrap(),
+        Some(current_session.session_id.clone())
+    );
     assert_ne!(stale_session.session_id, current_session.session_id);
 }
 
@@ -1028,6 +1055,51 @@ async fn correlation_lookup_rejects_multiple_active_sessions() {
     release_tx.send(()).unwrap();
     collect_events(first_invocation).await;
     collect_events(second_invocation).await;
+}
+
+#[tokio::test]
+async fn correlation_lookup_does_not_bypass_an_older_uncertain_invocation() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let runner = Arc::new(GateRunner {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+    });
+    let (_temp, store, router) = setup_with(runner);
+    let older_session = router.create_session(None, None).unwrap();
+    let current_session = router.create_session(None, None).unwrap();
+    let reconciliation = sdk::InvocationReconciliationStore::new(
+        store.sessions_dir().join("sdk").join("reconciliation"),
+    );
+    reconciliation
+        .insert(InvocationRecord {
+            invocation_id: Uuid::new_v4().to_string(),
+            session_id: older_session.session_id,
+            correlation_key: Some("shared-key".to_string()),
+            status: InvocationStatus::Uncertain,
+            accepted_at_ms: 1,
+            updated_at_ms: 2,
+            outcome: None,
+            uncertainty_reason: Some("recovered unfinished invocation".to_string()),
+            terminal_event: None,
+            terminal_scope_revision: None,
+        })
+        .unwrap();
+
+    let invocation = router
+        .prompt(&current_session.session_id, "current", Some("shared-key"))
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        router
+            .session_for_correlation_key("shared-key")
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable
+    );
+
+    release_tx.send(()).unwrap();
+    collect_events(invocation).await;
 }
 
 #[tokio::test]
@@ -1483,6 +1555,7 @@ async fn runtime_runner_streams_real_tool_lifecycle_through_the_router() {
         ]
     );
     assert_eq!(events[3].payload["output"], "payload");
+    assert_eq!(events[4].payload["output"], "complete");
     assert_eq!(
         router.reconcile(&invocation_id).unwrap().outcome,
         Some(InvocationOutcome::Completed { message_count: 4 })
@@ -1659,19 +1732,19 @@ async fn turn_prompt_terminal_outcome_is_available_after_event_receiver_drops() 
     let invocation = router.prompt(&session.session_id, "hello", None).unwrap();
     let invocation_id = invocation.invocation_id.clone();
     drop(invocation);
-    for _ in 0..200 {
-        if router
-            .reconcile(&invocation_id)
-            .is_ok_and(|record| record.status == InvocationStatus::Terminal)
-        {
-            break;
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(record) = router.reconcile(&invocation_id) {
+                if record.status == InvocationStatus::Terminal {
+                    return record;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        thread::sleep(Duration::from_millis(2));
-    }
-    assert_eq!(
-        router.reconcile(&invocation_id).unwrap().status,
-        InvocationStatus::Terminal
-    );
+    })
+    .await
+    .expect("invocation should eventually become terminal");
+    assert_eq!(terminal.status, InvocationStatus::Terminal);
 }
 
 #[tokio::test]

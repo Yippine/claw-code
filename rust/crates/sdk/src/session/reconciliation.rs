@@ -4,6 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{SdkError, SdkResult};
+
+static RECONCILIATION_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Lifecycle state persisted for an invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +74,9 @@ impl InvocationReconciliationStore {
 
     /// Inserts a new invocation record. Existing IDs are not overwritten.
     pub fn insert(&self, record: InvocationRecord) -> SdkResult<()> {
+        let _guard = RECONCILIATION_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = self.record_path(&record.invocation_id)?;
         if self.get(&record.invocation_id)?.is_some() {
             return Err(SdkError::invalid_input(format!(
@@ -83,6 +89,9 @@ impl InvocationReconciliationStore {
 
     /// Marks a non-terminal invocation as running.
     pub fn mark_running(&self, invocation_id: &str) -> SdkResult<()> {
+        let _guard = RECONCILIATION_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut record = self.required_record(invocation_id)?;
         if record.status != InvocationStatus::Accepted {
             return Err(SdkError::conflict(format!(
@@ -123,10 +132,27 @@ impl InvocationReconciliationStore {
         terminal_event: Option<serde_json::Value>,
         terminal_scope_revision: Option<u64>,
     ) -> SdkResult<()> {
+        let _guard = RECONCILIATION_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut record = self.required_record(invocation_id)?;
         if record.status == InvocationStatus::Terminal {
             return Err(SdkError::invalid_input(format!(
                 "invocation '{}' is already terminal",
+                invocation_id
+            )));
+        }
+        if record
+            .outcome
+            .as_ref()
+            .is_some_and(|pending| pending != &outcome)
+            || record
+                .terminal_event
+                .as_ref()
+                .is_some_and(|pending| Some(pending) != terminal_event.as_ref())
+        {
+            return Err(SdkError::conflict(format!(
+                "invocation '{}' has a different pending terminal result",
                 invocation_id
             )));
         }
@@ -135,6 +161,39 @@ impl InvocationReconciliationStore {
         record.uncertainty_reason = None;
         record.terminal_event = terminal_event;
         record.terminal_scope_revision = terminal_scope_revision;
+        record.updated_at_ms = updated_at_ms(record.updated_at_ms);
+        self.write_record(&record)
+    }
+
+    /// Persists a known turn result before its correlation scope is updated.
+    ///
+    /// The record remains non-terminal until the scope update succeeds, allowing
+    /// startup or a later reconciliation read to safely finish the transition.
+    pub fn record_pending_terminal(
+        &self,
+        invocation_id: &str,
+        outcome: InvocationOutcome,
+        terminal_event: serde_json::Value,
+    ) -> SdkResult<()> {
+        let _guard = RECONCILIATION_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut record = self.required_record(invocation_id)?;
+        if record.status == InvocationStatus::Terminal {
+            return Err(SdkError::invalid_input(format!(
+                "invocation '{}' is already terminal",
+                invocation_id
+            )));
+        }
+        if record.outcome.is_some() || record.terminal_event.is_some() {
+            return Err(SdkError::conflict(format!(
+                "invocation '{}' already has a pending terminal result",
+                invocation_id
+            )));
+        }
+        record.outcome = Some(outcome);
+        record.terminal_event = Some(terminal_event);
+        record.terminal_scope_revision = None;
         record.updated_at_ms = updated_at_ms(record.updated_at_ms);
         self.write_record(&record)
     }
@@ -202,6 +261,9 @@ impl InvocationReconciliationStore {
     /// Returns the records changed by this recovery pass; already uncertain and
     /// terminal records are left untouched and are not included in the result.
     pub fn reconcile_unfinished(&self) -> SdkResult<Vec<InvocationRecord>> {
+        let _guard = RECONCILIATION_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut recovered = Vec::new();
         for mut record in self.list()? {
             if matches!(
@@ -235,6 +297,9 @@ impl InvocationReconciliationStore {
         invocation_id: &str,
         update: impl FnOnce(&mut InvocationRecord),
     ) -> SdkResult<()> {
+        let _guard = RECONCILIATION_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut record = self.required_record(invocation_id)?;
         if record.status == InvocationStatus::Terminal {
             return Err(SdkError::invalid_input(format!(
@@ -337,7 +402,7 @@ fn updated_at_ms(previous: u64) -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
-    now.max(previous)
+    now.max(previous.saturating_add(1))
 }
 
 fn io_error(action: &str, path: &Path, error: std::io::Error) -> SdkError {
@@ -487,6 +552,111 @@ mod tests {
             .reconcile_unfinished()
             .expect("repeat recovery")
             .is_empty());
+    }
+
+    #[test]
+    fn pending_terminal_result_survives_uncertainty_and_can_be_finalized() {
+        let root = TestDirectory::new();
+        let store = InvocationReconciliationStore::new(&root.0);
+        store
+            .insert(accepted_record("pending"))
+            .expect("insert accepted record");
+        store.mark_running("pending").expect("mark running");
+        store
+            .record_pending_terminal(
+                "pending",
+                InvocationOutcome::Completed { message_count: 3 },
+                serde_json::json!({"eventType": "turn_ended"}),
+            )
+            .expect("record pending result");
+        store
+            .mark_uncertain("pending", "terminal scope store was unavailable")
+            .expect("mark uncertain");
+
+        let pending = store.get("pending").unwrap().unwrap();
+        assert_eq!(pending.status, InvocationStatus::Uncertain);
+        assert_eq!(
+            pending.outcome,
+            Some(InvocationOutcome::Completed { message_count: 3 })
+        );
+        store
+            .record_terminal_with_scope_revision(
+                "pending",
+                pending.outcome.unwrap(),
+                pending.terminal_event,
+                Some(1),
+            )
+            .expect("finalize after recovery");
+        assert_eq!(
+            store.get("pending").unwrap().unwrap().status,
+            InvocationStatus::Terminal
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_and_uncertain_transitions_preserve_terminal_result() {
+        let root = TestDirectory::new();
+        let store = InvocationReconciliationStore::new(&root.0);
+        store
+            .insert(accepted_record("concurrent"))
+            .expect("insert accepted record");
+        store.mark_running("concurrent").expect("mark running");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let terminal_store = store.clone();
+        let terminal_barrier = std::sync::Arc::clone(&barrier);
+        let terminal = std::thread::spawn(move || {
+            terminal_barrier.wait();
+            terminal_store.record_terminal(
+                "concurrent",
+                InvocationOutcome::Completed { message_count: 1 },
+                None,
+            )
+        });
+        let uncertain_store = store.clone();
+        let uncertain_barrier = std::sync::Arc::clone(&barrier);
+        let uncertain = std::thread::spawn(move || {
+            uncertain_barrier.wait();
+            uncertain_store.mark_uncertain("concurrent", "raced with terminal write")
+        });
+        barrier.wait();
+        let _ = terminal.join().expect("terminal writer thread");
+        let _ = uncertain.join().expect("uncertain writer thread");
+
+        let record = store.get("concurrent").unwrap().unwrap();
+        assert_eq!(record.status, InvocationStatus::Terminal);
+        assert_eq!(
+            record.outcome,
+            Some(InvocationOutcome::Completed { message_count: 1 })
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicate_inserts_have_only_one_winner() {
+        let root = TestDirectory::new();
+        let store = InvocationReconciliationStore::new(&root.0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_store = store.clone();
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.insert(accepted_record("duplicate"))
+        });
+        let second_store = store.clone();
+        let second_barrier = std::sync::Arc::clone(&barrier);
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_store.insert(accepted_record("duplicate"))
+        });
+        barrier.wait();
+        let first = first.join().expect("first insert thread");
+        let second = second.join().expect("second insert thread");
+
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert_eq!(
+            store.get("duplicate").unwrap().unwrap().invocation_id,
+            "duplicate"
+        );
     }
 
     #[test]

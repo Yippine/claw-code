@@ -67,6 +67,7 @@ pub enum ConversationEvent {
     AgentEnd {
         session_id: String,
         interrupted: bool,
+        output: Option<String>,
     },
 }
 
@@ -580,6 +581,7 @@ where
             session_id: session_id.clone(),
         });
         let mut interrupted = false;
+        let mut final_output = None;
         let outcome = (|| {
             // ROADMAP #38: Session-health canary - probe if context was compacted
             if self.session.compaction.is_some() {
@@ -645,6 +647,7 @@ where
                             return Err(error);
                         }
                     };
+                final_output = assistant_message_text(&assistant_message);
                 if let Some(usage) = usage {
                     self.usage_tracker.record(usage);
                 }
@@ -764,57 +767,71 @@ where
                         )
                     };
 
-                    let result_message = match permission_outcome {
-                        PermissionOutcome::Allow => {
-                            self.record_tool_started(iterations, &tool_name);
-                            let (mut output, mut is_error) =
-                                match self.tool_executor.execute(&tool_name, &effective_input) {
+                    let result_message = if self.turn_is_interrupted() {
+                        self.record_turn_interrupted(iterations, "before_tool_dispatch");
+                        interrupted = true;
+                        ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            "Interrupted by user before this tool could run.",
+                            true,
+                        )
+                    } else {
+                        match permission_outcome {
+                            PermissionOutcome::Allow => {
+                                self.record_tool_started(iterations, &tool_name);
+                                let (mut output, mut is_error) = match self
+                                    .tool_executor
+                                    .execute(&tool_name, &effective_input)
+                                {
                                     Ok(output) => (output, false),
                                     Err(error) => (error.to_string(), true),
                                 };
-                            output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+                                output =
+                                    merge_hook_feedback(pre_hook_result.messages(), output, false);
 
-                            let post_hook_result = if is_error {
-                                self.run_post_tool_use_failure_hook(
-                                    &tool_name,
-                                    &effective_input,
-                                    &output,
-                                )
-                            } else {
-                                self.run_post_tool_use_hook(
-                                    &tool_name,
-                                    &effective_input,
-                                    &output,
-                                    false,
-                                )
-                            };
-                            if post_hook_result.is_denied()
-                                || post_hook_result.is_failed()
-                                || post_hook_result.is_cancelled()
-                            {
-                                is_error = true;
-                            }
-                            output = merge_hook_feedback(
-                                post_hook_result.messages(),
-                                output,
-                                post_hook_result.is_denied()
+                                let post_hook_result = if is_error {
+                                    self.run_post_tool_use_failure_hook(
+                                        &tool_name,
+                                        &effective_input,
+                                        &output,
+                                    )
+                                } else {
+                                    self.run_post_tool_use_hook(
+                                        &tool_name,
+                                        &effective_input,
+                                        &output,
+                                        false,
+                                    )
+                                };
+                                if post_hook_result.is_denied()
                                     || post_hook_result.is_failed()
-                                    || post_hook_result.is_cancelled(),
-                            );
+                                    || post_hook_result.is_cancelled()
+                                {
+                                    is_error = true;
+                                }
+                                output = merge_hook_feedback(
+                                    post_hook_result.messages(),
+                                    output,
+                                    post_hook_result.is_denied()
+                                        || post_hook_result.is_failed()
+                                        || post_hook_result.is_cancelled(),
+                                );
 
-                            ConversationMessage::tool_result(
+                                ConversationMessage::tool_result(
+                                    tool_use_id,
+                                    tool_name,
+                                    output,
+                                    is_error,
+                                )
+                            }
+                            PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
                                 tool_use_id,
                                 tool_name,
-                                output,
-                                is_error,
-                            )
+                                merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                                true,
+                            ),
                         }
-                        PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                            tool_use_id,
-                            tool_name,
-                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                            true,
-                        ),
                     };
                     self.session
                         .push_message(result_message.clone())
@@ -859,6 +876,7 @@ where
         self.emit_conversation_event(ConversationEvent::AgentEnd {
             session_id,
             interrupted,
+            output: final_output,
         });
         outcome
     }
@@ -1122,6 +1140,18 @@ fn build_assistant_message(
     ))
 }
 
+fn assistant_message_text(message: &ConversationMessage) -> Option<String> {
+    let output = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    (!output.is_empty()).then_some(output)
+}
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -1356,6 +1386,7 @@ mod tests {
                 ConversationEvent::AgentEnd {
                     session_id,
                     interrupted: false,
+                    output: Some("done".to_string()),
                 },
             ]
         );
@@ -1492,6 +1523,86 @@ mod tests {
                 interrupted: true,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn abort_during_permission_prompt_prevents_tool_dispatch() {
+        struct ToolApi;
+
+        impl ApiClient for ToolApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "pending-tool".to_string(),
+                        name: "dangerous".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct BlockingAllowPrompter {
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl PermissionPrompter for BlockingAllowPrompter {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                self.started.send(()).expect("notify permission prompt");
+                self.release.recv().expect("wait for approval");
+                PermissionPromptDecision::Allow
+            }
+        }
+
+        let control = TurnControlSignal::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_calls = Arc::clone(&calls);
+        let executor = StaticToolExecutor::new().register("dangerous", move |_| {
+            tool_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("executed".to_string())
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let abort_control = control.clone();
+        let abort_thread = std::thread::spawn(move || {
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("permission prompt should start");
+            abort_control.abort();
+            release_tx.send(()).expect("release permission prompt");
+        });
+        let mut prompter = BlockingAllowPrompter {
+            started: started_tx,
+            release: release_rx,
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ToolApi,
+            executor,
+            PermissionPolicy::new(PermissionMode::Prompt),
+            vec!["system".to_string()],
+        )
+        .with_turn_control_signal(control);
+        let summary = runtime
+            .run_turn("start", Some(&mut prompter))
+            .expect("aborted approval should be a normal interruption");
+        abort_thread.join().expect("abort control thread");
+        let messages = runtime.session().messages.clone();
+
+        assert!(summary.interrupted);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            &messages[2].blocks[0],
+            ContentBlock::ToolResult {
+                is_error: true,
+                output,
+                ..
+            } if output.contains("Interrupted by user")
         ));
     }
 
@@ -2646,6 +2757,7 @@ mod tests {
                 ConversationEvent::AgentEnd {
                     session_id,
                     interrupted: true,
+                    output: Some("Running the tool.".to_string()),
                 },
             ]
         );

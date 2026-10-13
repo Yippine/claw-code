@@ -193,6 +193,7 @@ struct SessionRouterInner {
     runner: Arc<dyn SessionTurnRunner>,
     reconciliation: InvocationReconciliationStore,
     terminal_scopes: TerminalScopeStore,
+    reconciliation_lock: Mutex<()>,
     active: Mutex<HashMap<String, ActiveInvocation>>,
 }
 
@@ -319,10 +320,14 @@ impl SessionEventPublisher {
             ConversationEvent::AgentEnd {
                 session_id: _,
                 interrupted,
-            } => (
-                SessionEventType::AgentEnd,
-                json!({ "interrupted": interrupted }),
-            ),
+                output,
+            } => {
+                let mut payload = json!({ "interrupted": interrupted });
+                if let Some(output) = output {
+                    payload["output"] = Value::String(output);
+                }
+                (SessionEventType::AgentEnd, payload)
+            }
         };
         self.publish(event_type, payload, false);
     }
@@ -339,12 +344,14 @@ impl SessionRouter {
         let terminal_scopes = TerminalScopeStore::new(sdk_root.join("terminal-scopes"));
         reconciliation.reconcile_unfinished()?;
         recover_terminal_scopes(&reconciliation, &terminal_scopes)?;
+        recover_pending_terminal_outcomes(&reconciliation, &terminal_scopes)?;
         Ok(Self {
             inner: Arc::new(SessionRouterInner {
                 store,
                 runner,
                 reconciliation,
                 terminal_scopes,
+                reconciliation_lock: Mutex::new(()),
                 active: Mutex::new(HashMap::new()),
             }),
         })
@@ -371,6 +378,11 @@ impl SessionRouter {
             .save_to_path(&handle.path)
             .map_err(|error| SdkError::internal(format!("could not persist session: {error}")))?;
         if let Some(key) = correlation_key {
+            let _reconciliation_guard = self
+                .inner
+                .reconciliation_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.inner.terminal_scopes.set(key, &session.session_id)?;
         }
         Ok(session)
@@ -397,23 +409,32 @@ impl SessionRouter {
     /// Resolve the most recently recorded session for a correlation key.
     pub fn session_for_correlation_key(&self, correlation_key: &str) -> SdkResult<Option<String>> {
         validate_correlation_key(correlation_key)?;
-        {
+        let _reconciliation_guard = self
+            .inner
+            .reconciliation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recover_pending_terminal_outcomes(&self.inner.reconciliation, &self.inner.terminal_scopes)?;
+        let active_matches = {
             let active = self
                 .inner
                 .active
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut matches = active.iter().filter(|(_, invocation)| {
-                invocation.correlation_key.as_deref() == Some(correlation_key)
-            });
-            if let Some((session_id, _)) = matches.next() {
-                if matches.next().is_some() {
-                    return Err(SdkError::conflict(format!(
-                        "correlation key '{correlation_key}' has multiple active sessions"
-                    )));
-                }
-                return Ok(Some(session_id.clone()));
-            }
+            active
+                .iter()
+                .filter(|(_, invocation)| {
+                    invocation.correlation_key.as_deref() == Some(correlation_key)
+                })
+                .map(|(session_id, invocation)| {
+                    (session_id.clone(), invocation.invocation_id.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        if active_matches.len() > 1 {
+            return Err(SdkError::conflict(format!(
+                "correlation key '{correlation_key}' has multiple active sessions"
+            )));
         }
 
         let has_unfinished_invocation = self
@@ -421,11 +442,19 @@ impl SessionRouter {
             .reconciliation
             .list_by_correlation_key(correlation_key)?
             .iter()
-            .any(|record| record.status != InvocationStatus::Terminal);
+            .any(|record| {
+                record.status != InvocationStatus::Terminal
+                    && active_matches
+                        .first()
+                        .is_none_or(|(_, active_id)| record.invocation_id != *active_id)
+            });
         if has_unfinished_invocation {
             return Err(SdkError::unavailable(format!(
                 "correlation key '{correlation_key}' has an invocation awaiting reconciliation"
             )));
+        }
+        if let Some((session_id, _)) = active_matches.first() {
+            return Ok(Some(session_id.clone()));
         }
         let scope = self.inner.terminal_scopes.get(correlation_key)?;
         Ok(scope.map(|scope| scope.session_id))
@@ -442,7 +471,6 @@ impl SessionRouter {
         validate_session_id(session_id)?;
         validate_prompt(&prompt)?;
         validate_optional_correlation_key(correlation_key)?;
-        let session = self.get_session(session_id)?;
 
         let mut active = self
             .inner
@@ -454,6 +482,9 @@ impl SessionRouter {
                 "session `{session_id}` already has an active invocation"
             )));
         }
+        // Load after reserving the session slot. Loading before this lock lets a
+        // waiting prompt retain a stale snapshot and overwrite the prior turn.
+        let session = self.get_session(session_id)?;
 
         let invocation_id = Uuid::new_v4().to_string();
         let created_at_ms = now_ms();
@@ -710,6 +741,12 @@ impl SessionRouter {
     /// Return a durable invocation record for recovery after a disconnected client.
     pub fn reconcile(&self, invocation_id: &str) -> SdkResult<InvocationRecord> {
         validate_invocation_id(invocation_id)?;
+        let _reconciliation_guard = self
+            .inner
+            .reconciliation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recover_pending_terminal_outcomes(&self.inner.reconciliation, &self.inner.terminal_scopes)?;
         self.inner
             .reconciliation
             .get(invocation_id)?
@@ -724,6 +761,12 @@ impl SessionRouter {
         correlation_key: &str,
     ) -> SdkResult<Vec<InvocationRecord>> {
         validate_correlation_key(correlation_key)?;
+        let _reconciliation_guard = self
+            .inner
+            .reconciliation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recover_pending_terminal_outcomes(&self.inner.reconciliation, &self.inner.terminal_scopes)?;
         self.inner
             .reconciliation
             .list_by_correlation_key(correlation_key)
@@ -882,6 +925,10 @@ fn finish_invocation(
     publisher: &SessionEventPublisher,
     result: SessionRunResult,
 ) {
+    let _reconciliation_guard = inner
+        .reconciliation_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _publication_guard = publisher.lock();
     control.close();
 
@@ -916,6 +963,26 @@ fn finish_invocation(
     if let Some(error) = error_message {
         payload["error"] = Value::String(error);
     }
+    let terminal_event = publisher.build_locked(SessionEventType::TurnEnded, payload, true);
+    let stored_event = match serde_json::to_value(&terminal_event) {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = inner
+                .reconciliation
+                .mark_uncertain(invocation_id, error.to_string());
+            return;
+        }
+    };
+    if let Err(error) = inner.reconciliation.record_pending_terminal(
+        invocation_id,
+        outcome.clone(),
+        stored_event.clone(),
+    ) {
+        let _ = inner
+            .reconciliation
+            .mark_uncertain(invocation_id, error.to_string());
+        return;
+    }
     let terminal_scope_revision = match correlation_key {
         Some(key) => match inner.terminal_scopes.set(key, session_id) {
             Ok(scope) => Some(scope.revision),
@@ -927,16 +994,6 @@ fn finish_invocation(
             }
         },
         None => None,
-    };
-    let terminal_event = publisher.build_locked(SessionEventType::TurnEnded, payload, true);
-    let stored_event = match serde_json::to_value(&terminal_event) {
-        Ok(event) => event,
-        Err(error) => {
-            let _ = inner
-                .reconciliation
-                .mark_uncertain(invocation_id, error.to_string());
-            return;
-        }
     };
     match inner.reconciliation.record_terminal_with_scope_revision(
         invocation_id,
@@ -987,6 +1044,71 @@ fn recover_terminal_scopes(
     for (key, (revision, session_id)) in latest_by_key {
         validate_correlation_key(&key)?;
         terminal_scopes.restore_if_newer(&key, &session_id, revision)?;
+    }
+    Ok(())
+}
+
+fn recover_pending_terminal_outcomes(
+    reconciliation: &InvocationReconciliationStore,
+    terminal_scopes: &TerminalScopeStore,
+) -> SdkResult<()> {
+    let records = reconciliation.list()?;
+    let mut latest_terminal_update = BTreeMap::<String, u64>::new();
+    let mut original_scope_update = BTreeMap::<String, Option<u64>>::new();
+    let mut pending = Vec::new();
+    for record in records {
+        if record.status == InvocationStatus::Terminal {
+            if let Some(key) = record.correlation_key.as_ref() {
+                latest_terminal_update
+                    .entry(key.clone())
+                    .and_modify(|updated_at| *updated_at = (*updated_at).max(record.updated_at_ms))
+                    .or_insert(record.updated_at_ms);
+            }
+        } else if record.outcome.is_some() && record.terminal_event.is_some() {
+            pending.push(record);
+        }
+    }
+    pending.sort_by(|left, right| {
+        left.updated_at_ms
+            .cmp(&right.updated_at_ms)
+            .then_with(|| left.invocation_id.cmp(&right.invocation_id))
+    });
+
+    for record in pending {
+        let scope_revision = match record.correlation_key.as_deref() {
+            Some(key) => {
+                let scope_updated_at = if let Some(updated_at) = original_scope_update.get(key) {
+                    *updated_at
+                } else {
+                    let updated_at = terminal_scopes.get(key)?.map(|scope| scope.updated_at_ms);
+                    original_scope_update.insert(key.to_string(), updated_at);
+                    updated_at
+                };
+                let newer_terminal = latest_terminal_update
+                    .get(key)
+                    .is_some_and(|updated_at| *updated_at >= record.updated_at_ms);
+                let newer_scope =
+                    scope_updated_at.is_some_and(|updated_at| updated_at >= record.updated_at_ms);
+                if newer_terminal || newer_scope {
+                    None
+                } else {
+                    Some(terminal_scopes.set(key, &record.session_id)?.revision)
+                }
+            }
+            None => None,
+        };
+        reconciliation.record_terminal_with_scope_revision(
+            &record.invocation_id,
+            record
+                .outcome
+                .ok_or_else(|| SdkError::internal("pending terminal outcome is missing"))?,
+            Some(
+                record
+                    .terminal_event
+                    .ok_or_else(|| SdkError::internal("pending terminal event is missing"))?,
+            ),
+            scope_revision,
+        )?;
     }
     Ok(())
 }
