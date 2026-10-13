@@ -53,6 +53,7 @@ pub struct InvocationRecord {
     pub outcome: Option<InvocationOutcome>,
     pub uncertainty_reason: Option<String>,
     pub terminal_event: Option<serde_json::Value>,
+    pub terminal_scope_revision: Option<u64>,
 }
 
 /// File-backed store for invocation lifecycle reconciliation.
@@ -111,6 +112,17 @@ impl InvocationReconciliationStore {
         outcome: InvocationOutcome,
         terminal_event: Option<serde_json::Value>,
     ) -> SdkResult<()> {
+        self.record_terminal_with_scope_revision(invocation_id, outcome, terminal_event, None)
+    }
+
+    /// Records a terminal result together with its durable correlation-scope revision.
+    pub fn record_terminal_with_scope_revision(
+        &self,
+        invocation_id: &str,
+        outcome: InvocationOutcome,
+        terminal_event: Option<serde_json::Value>,
+        terminal_scope_revision: Option<u64>,
+    ) -> SdkResult<()> {
         let mut record = self.required_record(invocation_id)?;
         if record.status == InvocationStatus::Terminal {
             return Err(SdkError::invalid_input(format!(
@@ -122,6 +134,7 @@ impl InvocationReconciliationStore {
         record.outcome = Some(outcome);
         record.uncertainty_reason = None;
         record.terminal_event = terminal_event;
+        record.terminal_scope_revision = terminal_scope_revision;
         record.updated_at_ms = updated_at_ms(record.updated_at_ms);
         self.write_record(&record)
     }
@@ -362,6 +375,7 @@ mod tests {
             outcome: None,
             uncertainty_reason: None,
             terminal_event: None,
+            terminal_scope_revision: None,
         }
     }
 

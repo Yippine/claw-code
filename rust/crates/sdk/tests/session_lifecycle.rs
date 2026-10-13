@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -897,7 +897,7 @@ fn reconciliation_returns_not_found_for_unknown_invocation() {
 fn startup_recovers_running_invocations_as_uncertain() {
     let (_temp, store, router) = setup();
     let session = router
-        .create_session(None, None)
+        .create_session(None, Some("recover-me"))
         .expect("session should persist");
     let invocation_id = Uuid::new_v4().to_string();
     let reconciliation = sdk::InvocationReconciliationStore::new(
@@ -914,11 +914,16 @@ fn startup_recovers_running_invocations_as_uncertain() {
             outcome: None,
             uncertainty_reason: None,
             terminal_event: None,
+            terminal_scope_revision: None,
         })
         .expect("running record");
     let restarted = SessionRouter::new(store, Arc::new(EchoRunner)).expect("new router");
     let record = restarted.reconcile(&invocation_id).unwrap();
     assert_eq!(record.status, InvocationStatus::Uncertain);
+    let error = restarted
+        .session_for_correlation_key("recover-me")
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable);
 }
 
 #[test]
@@ -936,6 +941,41 @@ fn terminal_scope_survives_router_restart() {
         Some(session.session_id)
     );
     assert!(temp.path().exists());
+}
+
+#[tokio::test]
+async fn terminal_scope_write_failure_keeps_outcome_uncertain_and_blocks_stale_routing() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let runner = Arc::new(GateRunner {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+    });
+    let (_temp, store, router) = setup_with(runner);
+    let stale_session = router.create_session(None, Some("repair-key")).unwrap();
+    let current_session = router.create_session(None, None).unwrap();
+    let invocation = router
+        .prompt(&current_session.session_id, "complete", Some("repair-key"))
+        .unwrap();
+    let invocation_id = invocation.invocation_id.clone();
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let scope_root = store.sessions_dir().join("sdk").join("terminal-scopes");
+    std::fs::remove_dir_all(&scope_root).unwrap();
+    std::fs::write(&scope_root, "block the scope store").unwrap();
+    release_tx.send(()).unwrap();
+
+    let events = collect_events(invocation).await;
+    assert_eq!(
+        events.last().unwrap().event_type,
+        SessionEventType::AgentEnd
+    );
+    assert_eq!(
+        router.reconcile(&invocation_id).unwrap().status,
+        InvocationStatus::Uncertain
+    );
+    assert!(router.session_for_correlation_key("repair-key").is_err());
+    assert_ne!(stale_session.session_id, current_session.session_id);
 }
 
 #[test]
@@ -956,6 +996,38 @@ fn terminal_scope_keys_do_not_collide() {
         router.session_for_correlation_key("key-two").unwrap(),
         Some(second.session_id)
     );
+}
+
+#[tokio::test]
+async fn correlation_lookup_rejects_multiple_active_sessions() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(2);
+    let runner = Arc::new(GateRunner {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+    });
+    let (_temp, _store, router) = setup_with(runner);
+    let first = router.create_session(None, Some("active-key")).unwrap();
+    let second = router.create_session(None, Some("active-key")).unwrap();
+    let first_invocation = router
+        .prompt(&first.session_id, "first", Some("active-key"))
+        .unwrap();
+    let second_invocation = router
+        .prompt(&second.session_id, "second", Some("active-key"))
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    assert_eq!(
+        router
+            .session_for_correlation_key("active-key")
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    release_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+    collect_events(first_invocation).await;
+    collect_events(second_invocation).await;
 }
 
 #[tokio::test]
@@ -1274,6 +1346,7 @@ fn new_router_recovers_only_unfinished_invocations() {
             outcome: Some(InvocationOutcome::Completed { message_count: 0 }),
             uncertainty_reason: None,
             terminal_event: Some(json!({ "type": "turn_ended" })),
+            terminal_scope_revision: Some(1),
         })
         .unwrap();
     let restarted = SessionRouter::new(store, Arc::new(EchoRunner)).unwrap();
@@ -1286,6 +1359,43 @@ fn new_router_recovers_only_unfinished_invocations() {
             .session_for_correlation_key("restored-terminal-scope")
             .unwrap(),
         Some(session.session_id)
+    );
+}
+
+#[test]
+fn terminal_scope_recovery_uses_revision_when_timestamps_tie() {
+    let (_temp, store, router) = setup();
+    let first = router.create_session(None, Some("revision-tie")).unwrap();
+    let latest = router.create_session(None, None).unwrap();
+    let reconciliation = sdk::InvocationReconciliationStore::new(
+        store.sessions_dir().join("sdk").join("reconciliation"),
+    );
+    for (invocation_id, session_id, revision) in [
+        ("invocation-a", first.session_id.as_str(), 1),
+        ("invocation-z", latest.session_id.as_str(), 2),
+    ] {
+        reconciliation
+            .insert(InvocationRecord {
+                invocation_id: invocation_id.to_string(),
+                session_id: session_id.to_string(),
+                correlation_key: Some("revision-tie".to_string()),
+                status: InvocationStatus::Terminal,
+                accepted_at_ms: 10,
+                updated_at_ms: 20,
+                outcome: Some(InvocationOutcome::Completed { message_count: 1 }),
+                uncertainty_reason: None,
+                terminal_event: Some(json!({ "type": "turn_ended" })),
+                terminal_scope_revision: Some(revision),
+            })
+            .unwrap();
+    }
+
+    let restarted = SessionRouter::new(store, Arc::new(EchoRunner)).unwrap();
+    assert_eq!(
+        restarted
+            .session_for_correlation_key("revision-tie")
+            .unwrap(),
+        Some(latest.session_id)
     );
 }
 
@@ -1657,6 +1767,59 @@ async fn turn_steer_event_is_sequenced_after_acceptance() {
         .position(|event| event.event_type == SessionEventType::TurnSteered)
         .unwrap();
     assert!(steer_index > 0);
+}
+
+#[tokio::test]
+async fn concurrent_steer_and_completion_preserve_sequence_and_terminal_order() {
+    for _ in 0..16 {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let runner = Arc::new(GateRunner {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+        });
+        let (_temp, _store, router) = setup_with(runner);
+        let session = router.create_session(None, None).unwrap();
+        let invocation = router.prompt(&session.session_id, "initial", None).unwrap();
+        let invocation_id = invocation.invocation_id.clone();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let steer_router = router.clone();
+        let steer_session_id = session.session_id.clone();
+        let steer_invocation_id = invocation_id.clone();
+        let steer_barrier = Arc::clone(&barrier);
+        let steer_thread = thread::spawn(move || {
+            steer_barrier.wait();
+            steer_router
+                .steer(&steer_session_id, &steer_invocation_id, "racing steer")
+                .is_ok()
+        });
+        let finish_barrier = Arc::clone(&barrier);
+        let finish_thread = thread::spawn(move || {
+            finish_barrier.wait();
+            release_tx.send(()).unwrap();
+        });
+        barrier.wait();
+
+        let steer_accepted = steer_thread.join().unwrap();
+        finish_thread.join().unwrap();
+        let events = collect_events(invocation).await;
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+        assert_eq!(
+            events.last().unwrap().event_type,
+            SessionEventType::TurnEnded
+        );
+        let steer_index = events
+            .iter()
+            .position(|event| event.event_type == SessionEventType::TurnSteered);
+        assert_eq!(steer_accepted, steer_index.is_some());
+        if let Some(index) = steer_index {
+            assert!(index < events.len() - 1);
+        }
+    }
 }
 
 #[test]

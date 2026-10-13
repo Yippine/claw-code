@@ -3,6 +3,7 @@
 use std::{
     fs,
     path::PathBuf,
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,12 +14,14 @@ use crate::error::{SdkError, SdkResult};
 use super::reconciliation::atomic_write_json;
 
 const MAX_CORRELATION_KEY_BYTES: usize = 512;
+static TERMINAL_SCOPE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Persisted terminal-session scope for one correlation key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalScopeRecord {
     pub correlation_key: String,
     pub session_id: String,
+    pub revision: u64,
     pub updated_at_ms: u64,
 }
 
@@ -40,24 +43,69 @@ impl TerminalScopeStore {
         &self,
         correlation_key: impl Into<String>,
         session_id: impl Into<String>,
-    ) -> SdkResult<()> {
+    ) -> SdkResult<TerminalScopeRecord> {
         let correlation_key = correlation_key.into();
         validate_correlation_key(&correlation_key)?;
-        let path = self.record_path(&correlation_key);
-        let previous_updated_at = self
-            .get(&correlation_key)?
-            .map_or(0, |record| record.updated_at_ms);
+        let _guard = TERMINAL_SCOPE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = self.read_record(&correlation_key)?;
+        let revision = previous
+            .as_ref()
+            .map_or(Some(1), |record| record.revision.checked_add(1))
+            .ok_or_else(|| SdkError::internal("terminal scope revision is exhausted"))?;
+        let previous_updated_at = previous.map_or(0, |record| record.updated_at_ms);
         let record = TerminalScopeRecord {
-            correlation_key,
+            correlation_key: correlation_key.clone(),
             session_id: session_id.into(),
+            revision,
             updated_at_ms: current_timestamp_ms().max(previous_updated_at),
         };
-        atomic_write_json(&path, &record)
+        atomic_write_json(&self.record_path(&correlation_key), &record)?;
+        Ok(record)
+    }
+
+    /// Rebuilds a mapping from durable invocation history without moving it backward.
+    pub fn restore_if_newer(
+        &self,
+        correlation_key: &str,
+        session_id: &str,
+        revision: u64,
+    ) -> SdkResult<()> {
+        validate_correlation_key(correlation_key)?;
+        let _guard = TERMINAL_SCOPE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = self.read_record(correlation_key)?;
+        match previous.as_ref() {
+            Some(record) if record.revision > revision => return Ok(()),
+            Some(record) if record.revision == revision && record.session_id == session_id => {
+                return Ok(())
+            }
+            Some(record) if record.revision == revision => {
+                return Err(SdkError::internal(format!(
+                    "terminal scope revision {revision} conflicts for key '{correlation_key}'"
+                )));
+            }
+            _ => {}
+        }
+        let record = TerminalScopeRecord {
+            correlation_key: correlation_key.to_string(),
+            session_id: session_id.to_string(),
+            revision,
+            updated_at_ms: current_timestamp_ms()
+                .max(previous.map_or(0, |record| record.updated_at_ms)),
+        };
+        atomic_write_json(&self.record_path(correlation_key), &record)
     }
 
     /// Loads the session associated with a correlation key, if present.
     pub fn get(&self, correlation_key: &str) -> SdkResult<Option<TerminalScopeRecord>> {
         validate_correlation_key(correlation_key)?;
+        self.read_record(correlation_key)
+    }
+
+    fn read_record(&self, correlation_key: &str) -> SdkResult<Option<TerminalScopeRecord>> {
         let path = self.record_path(correlation_key);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -160,6 +208,26 @@ mod tests {
             .expect("scope exists");
         assert_eq!(loaded.correlation_key, "request-1");
         assert_eq!(loaded.session_id, "session-1");
+    }
+
+    #[test]
+    fn scope_revisions_increase_and_recovery_never_moves_backward() {
+        let root = TestDirectory::new();
+        let store = TerminalScopeStore::new(&root.0);
+        let first = store.set("request-1", "session-1").unwrap();
+        let second = store.set("request-1", "session-2").unwrap();
+        assert_eq!(second.revision, first.revision + 1);
+
+        store
+            .restore_if_newer("request-1", "session-1", first.revision)
+            .expect("stale scope restoration should be ignored");
+        assert_eq!(
+            store.get("request-1").unwrap().unwrap().session_id,
+            "session-2"
+        );
+        assert!(store
+            .restore_if_newer("request-1", "other-session", second.revision)
+            .is_err());
     }
 
     #[test]

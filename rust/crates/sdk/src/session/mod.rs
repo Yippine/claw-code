@@ -13,7 +13,7 @@ pub use terminal_scope::{TerminalScopeRecord, TerminalScopeStore};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -209,6 +209,7 @@ struct SessionEventPublisher {
     session_id: String,
     invocation_id: String,
     sequence: std::sync::atomic::AtomicU64,
+    publication_lock: Mutex<()>,
     sender: mpsc::UnboundedSender<SessionEvent>,
 }
 
@@ -222,11 +223,23 @@ impl SessionEventPublisher {
             session_id,
             invocation_id,
             sequence: std::sync::atomic::AtomicU64::new(0),
+            publication_lock: Mutex::new(()),
             sender,
         }
     }
 
-    fn build(&self, event_type: SessionEventType, payload: Value, durable: bool) -> SessionEvent {
+    fn lock(&self) -> MutexGuard<'_, ()> {
+        self.publication_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn build_locked(
+        &self,
+        event_type: SessionEventType,
+        payload: Value,
+        durable: bool,
+    ) -> SessionEvent {
         let sequence = self
             .sequence
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -244,9 +257,32 @@ impl SessionEventPublisher {
     }
 
     fn publish(&self, event_type: SessionEventType, payload: Value, durable: bool) -> SessionEvent {
-        let event = self.build(event_type, payload, durable);
+        let _guard = self.lock();
+        self.publish_locked(event_type, payload, durable)
+    }
+
+    fn publish_locked(
+        &self,
+        event_type: SessionEventType,
+        payload: Value,
+        durable: bool,
+    ) -> SessionEvent {
+        let event = self.build_locked(event_type, payload, durable);
         let _ = self.sender.send(event.clone());
         event
+    }
+
+    fn publish_steer(&self, control: &TurnControlSignal, prompt: &str) -> bool {
+        let _guard = self.lock();
+        if !control.steer(prompt.to_string()) {
+            return false;
+        }
+        self.publish_locked(
+            SessionEventType::TurnSteered,
+            json!({ "prompt": prompt }),
+            false,
+        );
+        true
     }
 
     fn publish_runtime_event(&self, event: ConversationEvent) {
@@ -361,11 +397,38 @@ impl SessionRouter {
     /// Resolve the most recently recorded session for a correlation key.
     pub fn session_for_correlation_key(&self, correlation_key: &str) -> SdkResult<Option<String>> {
         validate_correlation_key(correlation_key)?;
-        Ok(self
+        {
+            let active = self
+                .inner
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut matches = active.iter().filter(|(_, invocation)| {
+                invocation.correlation_key.as_deref() == Some(correlation_key)
+            });
+            if let Some((session_id, _)) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(SdkError::conflict(format!(
+                        "correlation key '{correlation_key}' has multiple active sessions"
+                    )));
+                }
+                return Ok(Some(session_id.clone()));
+            }
+        }
+
+        let has_unfinished_invocation = self
             .inner
-            .terminal_scopes
-            .get(correlation_key)?
-            .map(|scope| scope.session_id))
+            .reconciliation
+            .list_by_correlation_key(correlation_key)?
+            .iter()
+            .any(|record| record.status != InvocationStatus::Terminal);
+        if has_unfinished_invocation {
+            return Err(SdkError::unavailable(format!(
+                "correlation key '{correlation_key}' has an invocation awaiting reconciliation"
+            )));
+        }
+        let scope = self.inner.terminal_scopes.get(correlation_key)?;
+        Ok(scope.map(|scope| scope.session_id))
     }
 
     /// Start a prompt and return immediately with an ordered event receiver.
@@ -404,6 +467,7 @@ impl SessionRouter {
             outcome: None,
             uncertainty_reason: None,
             terminal_event: None,
+            terminal_scope_revision: None,
         };
         self.inner.reconciliation.insert(record)?;
 
@@ -447,8 +511,9 @@ impl SessionRouter {
                 if let Err(error) = inner.reconciliation.mark_running(&worker_invocation_id) {
                     finish_uncertain(
                         &inner,
-                        &worker_session_id,
                         &worker_invocation_id,
+                        &worker_control,
+                        &worker_publisher,
                         &error.to_string(),
                     );
                     remove_active(&inner, &worker_session_id, &worker_invocation_id);
@@ -469,6 +534,7 @@ impl SessionRouter {
                         &worker_session_id,
                         &worker_invocation_id,
                         worker_correlation_key.as_deref(),
+                        &worker_control,
                         &worker_publisher,
                         run_result,
                     ),
@@ -476,8 +542,9 @@ impl SessionRouter {
                         let reason = panic_message(panic);
                         finish_uncertain(
                             &inner,
-                            &worker_session_id,
                             &worker_invocation_id,
+                            &worker_control,
+                            &worker_publisher,
                             &reason,
                         );
                     }
@@ -493,6 +560,7 @@ impl SessionRouter {
                 session_id,
                 &invocation_id,
                 correlation_key,
+                &control,
                 &publisher,
                 SessionRunResult::Failed { session, message },
             );
@@ -518,27 +586,28 @@ impl SessionRouter {
         validate_invocation_id(invocation_id)?;
         let prompt = override_prompt.into();
         validate_prompt(&prompt)?;
-        let active = self
-            .inner
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let invocation = active
-            .get(session_id)
-            .ok_or_else(|| SdkError::not_found("session has no active invocation"))?;
-        if invocation.invocation_id != invocation_id {
-            return Err(SdkError::not_found(format!(
-                "invocation `{invocation_id}` is not active for session `{session_id}`"
-            )));
-        }
-        if !invocation.control.steer(prompt.clone()) {
+        let (control, publisher) = {
+            let active = self
+                .inner
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let invocation = active
+                .get(session_id)
+                .ok_or_else(|| SdkError::not_found("session has no active invocation"))?;
+            if invocation.invocation_id != invocation_id {
+                return Err(SdkError::not_found(format!(
+                    "invocation `{invocation_id}` is not active for session `{session_id}`"
+                )));
+            }
+            (
+                invocation.control.clone(),
+                Arc::clone(&invocation.event_publisher),
+            )
+        };
+        if !publisher.publish_steer(&control, &prompt) {
             return Err(SdkError::conflict("invocation no longer accepts steering"));
         }
-        invocation.event_publisher.publish(
-            SessionEventType::TurnSteered,
-            json!({ "prompt": prompt }),
-            false,
-        );
         Ok(())
     }
 
@@ -554,7 +623,7 @@ impl SessionRouter {
         validate_prompt(&prompt)?;
         validate_optional_correlation_key(correlation_key)?;
 
-        let (mut done, inherited_correlation) = {
+        let (mut done, inherited_correlation, previous_invocation_id) = {
             let active = self
                 .inner
                 .active
@@ -566,9 +635,10 @@ impl SessionRouter {
                     (
                         Some(invocation.done.clone()),
                         invocation.correlation_key.clone(),
+                        Some(invocation.invocation_id.clone()),
                     )
                 }
-                None => (None, None),
+                None => (None, None, None),
             }
         };
         if let Some(receiver) = done.as_mut() {
@@ -576,6 +646,19 @@ impl SessionRouter {
                 receiver.changed().await.map_err(|_| {
                     SdkError::unavailable("session invocation stopped unexpectedly")
                 })?;
+            }
+        }
+
+        if let Some(invocation_id) = previous_invocation_id {
+            let record = self
+                .inner
+                .reconciliation
+                .get(&invocation_id)?
+                .ok_or_else(|| SdkError::not_found("aborted invocation record was not found"))?;
+            if record.status != InvocationStatus::Terminal {
+                return Err(SdkError::unavailable(format!(
+                    "invocation `{invocation_id}` has no durable terminal outcome"
+                )));
             }
         }
 
@@ -795,9 +878,13 @@ fn finish_invocation(
     session_id: &str,
     invocation_id: &str,
     correlation_key: Option<&str>,
+    control: &TurnControlSignal,
     publisher: &SessionEventPublisher,
     result: SessionRunResult,
 ) {
+    let _publication_guard = publisher.lock();
+    control.close();
+
     let (outcome, message_count, status, error_message) = match result {
         SessionRunResult::Completed(session) => (
             InvocationOutcome::Completed {
@@ -829,7 +916,19 @@ fn finish_invocation(
     if let Some(error) = error_message {
         payload["error"] = Value::String(error);
     }
-    let terminal_event = publisher.build(SessionEventType::TurnEnded, payload, true);
+    let terminal_scope_revision = match correlation_key {
+        Some(key) => match inner.terminal_scopes.set(key, session_id) {
+            Ok(scope) => Some(scope.revision),
+            Err(error) => {
+                let _ = inner
+                    .reconciliation
+                    .mark_uncertain(invocation_id, error.to_string());
+                return;
+            }
+        },
+        None => None,
+    };
+    let terminal_event = publisher.build_locked(SessionEventType::TurnEnded, payload, true);
     let stored_event = match serde_json::to_value(&terminal_event) {
         Ok(event) => event,
         Err(error) => {
@@ -839,14 +938,13 @@ fn finish_invocation(
             return;
         }
     };
-    match inner
-        .reconciliation
-        .record_terminal(invocation_id, outcome, Some(stored_event))
-    {
+    match inner.reconciliation.record_terminal_with_scope_revision(
+        invocation_id,
+        outcome,
+        Some(stored_event),
+        terminal_scope_revision,
+    ) {
         Ok(()) => {
-            if let Some(key) = correlation_key {
-                let _ = inner.terminal_scopes.set(key, session_id);
-            }
             let _ = publisher.sender.send(terminal_event);
         }
         Err(error) => {
@@ -861,7 +959,7 @@ fn recover_terminal_scopes(
     reconciliation: &InvocationReconciliationStore,
     terminal_scopes: &TerminalScopeStore,
 ) -> SdkResult<()> {
-    let mut latest_by_key = BTreeMap::<String, InvocationRecord>::new();
+    let mut latest_by_key = BTreeMap::<String, (u64, String)>::new();
     for record in reconciliation.list()? {
         if record.status != InvocationStatus::Terminal {
             continue;
@@ -869,29 +967,39 @@ fn recover_terminal_scopes(
         let Some(key) = record.correlation_key.as_ref() else {
             continue;
         };
-        if !latest_by_key
-            .get(key)
-            .is_some_and(|current| current.updated_at_ms >= record.updated_at_ms)
-        {
-            latest_by_key.insert(key.clone(), record);
+        let Some(revision) = record.terminal_scope_revision else {
+            continue;
+        };
+        match latest_by_key.get(key) {
+            Some((current_revision, current_session)) if *current_revision == revision => {
+                if current_session != &record.session_id {
+                    return Err(SdkError::internal(format!(
+                        "terminal scope revision {revision} conflicts for key '{key}'"
+                    )));
+                }
+            }
+            Some((current_revision, _)) if *current_revision > revision => {}
+            _ => {
+                latest_by_key.insert(key.clone(), (revision, record.session_id));
+            }
         }
     }
-    for (key, record) in latest_by_key {
+    for (key, (revision, session_id)) in latest_by_key {
         validate_correlation_key(&key)?;
-        let existing = terminal_scopes.get(&key)?;
-        if existing.is_none_or(|scope| scope.updated_at_ms < record.updated_at_ms) {
-            terminal_scopes.set(key, record.session_id)?;
-        }
+        terminal_scopes.restore_if_newer(&key, &session_id, revision)?;
     }
     Ok(())
 }
 
 fn finish_uncertain(
     inner: &SessionRouterInner,
-    _session_id: &str,
     invocation_id: &str,
+    control: &TurnControlSignal,
+    publisher: &SessionEventPublisher,
     reason: &str,
 ) {
+    let _publication_guard = publisher.lock();
+    control.close();
     let _ = inner
         .reconciliation
         .mark_uncertain(invocation_id, reason.to_string());
