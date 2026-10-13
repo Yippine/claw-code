@@ -15032,6 +15032,37 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
 
+    /// Snapshot-restore guard for a single environment variable.
+    /// Captures the original value on construction, applies the override,
+    /// and restores on drop so tests leave the process env untouched.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
             "plugin-demo@external",
@@ -19927,6 +19958,7 @@ UU conflicted.rs",
 
     #[test]
     fn explicit_model_provider_hint_controls_runtime_provider_dispatch() {
+        let _openai_base_url = EnvVarGuard::unset("OPENAI_BASE_URL");
         let config = api::ProviderConfig {
             kind: api::ProviderConfigKind::DashScope,
             model: "qwen-plus".to_string(),
