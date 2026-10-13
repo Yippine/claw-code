@@ -41,6 +41,7 @@ mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod session_settings;
 pub mod trident;
 pub use session_control::SessionStore;
 mod sse;
@@ -178,6 +179,10 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
     SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+};
+pub use session_settings::{
+    ConfigHotreloadMonitor, SettingApplicator, SettingCategory, SettingSchema, SettingSchemaRegistry,
+    SettingType, SessionSettings,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
