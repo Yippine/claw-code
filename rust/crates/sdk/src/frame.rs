@@ -1,45 +1,40 @@
-//! Frame types and serialization for the SDK wire protocol.
+//! Typed frame structures and JSON serialization for the SDK wire protocol.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use uuid::Uuid;
 
 use crate::error::{SdkError, SdkResult};
 
-/// Protocol version implemented.
+/// Protocol version implemented by this SDK client.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Maximum UTF-8 byte length for a single broker JSON frame.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-/// Frame type identifier.
+/// Known frame type identifiers in the SDK wire protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
-    /// Hello frame sent by broker on connection
+    Hello,
+    ServerHello,
     BrokerHello,
-    /// Request frame from client to broker
     BrokerRequest,
-    /// Response frame from broker to client
     BrokerResponse,
-    /// Query request
     QueryRequest,
-    /// Query response
     QueryResponse,
-    /// Control request
     ControlRequest,
-    /// Control response
     ControlResponse,
-    /// Event replay request
     EventReplay,
-    /// Event replay result
     EventReplayResult,
-    /// Session activation
     SessionActivate,
-    /// Session activation result
     SessionActivateResult,
 }
 
 impl FrameType {
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Hello => "hello",
+            Self::ServerHello => "server_hello",
             Self::BrokerHello => "broker_hello",
             Self::BrokerRequest => "broker_request",
             Self::BrokerResponse => "broker_response",
@@ -54,8 +49,10 @@ impl FrameType {
         }
     }
 
-    pub fn parse(s: &str) -> SdkResult<Self> {
-        match s {
+    pub fn parse(value: &str) -> SdkResult<Self> {
+        match value {
+            "hello" => Ok(Self::Hello),
+            "server_hello" => Ok(Self::ServerHello),
             "broker_hello" => Ok(Self::BrokerHello),
             "broker_request" => Ok(Self::BrokerRequest),
             "broker_response" => Ok(Self::BrokerResponse),
@@ -67,50 +64,81 @@ impl FrameType {
             "event_replay_result" => Ok(Self::EventReplayResult),
             "session_activate" => Ok(Self::SessionActivate),
             "session_activate_result" => Ok(Self::SessionActivateResult),
-            _ => Err(SdkError::frame_error(format!("unknown frame type: {}", s))),
+            _ => Err(SdkError::frame_error(format!(
+                "unknown frame type: {value}"
+            ))),
         }
     }
 }
 
-/// A frame in the SDK wire protocol.
+/// A typed JSON-object frame in the SDK wire protocol.
 ///
-/// Frames are JSON objects with a `type` field and optional `id` field for correlation.
-#[derive(Debug, Clone)]
-pub struct Frame {
-    /// Underlying JSON value
+/// The map remains open-ended to allow operation-specific fields while the frame type,
+/// correlation UUID, and handshake are validated by the client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SdkFrame {
+    /// Underlying JSON object.
     pub data: Map<String, Value>,
 }
 
-impl Frame {
-    /// Create a new frame from a JSON object.
+impl SdkFrame {
+    /// Create a frame from a JSON object.
     pub fn new(data: Map<String, Value>) -> Self {
         Self { data }
     }
 
-    /// Create an empty frame.
+    /// Create an empty frame object.
     pub fn empty() -> Self {
-        Self { data: Map::new() }
+        Self::new(Map::new())
     }
 
-    /// Get the frame type.
+    /// Parse and validate the frame's `type` field.
     pub fn frame_type(&self) -> SdkResult<FrameType> {
-        let frame_type_str = self
+        let frame_type = self
             .data
             .get("type")
             .and_then(Value::as_str)
             .ok_or_else(|| SdkError::frame_error("missing 'type' field"))?;
-        FrameType::parse(frame_type_str)
+        FrameType::parse(frame_type)
     }
 
-    /// Get the optional request/response ID for correlation.
-    pub fn id(&self) -> Option<String> {
+    /// Get the optional UUID used for request/response correlation.
+    pub fn id(&self) -> SdkResult<Option<Uuid>> {
+        match self.data.get("id") {
+            None => Ok(None),
+            Some(Value::String(id)) => Uuid::parse_str(id).map(Some).map_err(|error| {
+                SdkError::correlation_error(format!("invalid frame UUID: {error}"))
+            }),
+            Some(_) => Err(SdkError::correlation_error(
+                "frame 'id' field must be a UUID string",
+            )),
+        }
+    }
+
+    /// Set the frame's correlation UUID.
+    pub fn set_id(&mut self, id: Uuid) {
         self.data
-            .get("id")
-            .and_then(Value::as_str)
-            .map(String::from)
+            .insert("id".to_string(), Value::String(id.to_string()));
     }
 
-    /// Get the `ok` boolean field from a response frame.
+    /// Read a response correlation UUID from either supported field name.
+    pub fn response_id(&self) -> SdkResult<Option<Uuid>> {
+        if self.data.contains_key("id") {
+            return self.id();
+        }
+        match self.data.get("requestId") {
+            None => Ok(None),
+            Some(Value::String(id)) => Uuid::parse_str(id).map(Some).map_err(|error| {
+                SdkError::correlation_error(format!("invalid response UUID: {error}"))
+            }),
+            Some(_) => Err(SdkError::correlation_error(
+                "frame 'requestId' field must be a UUID string",
+            )),
+        }
+    }
+
+    /// Read the `ok` boolean from a response frame.
     pub fn ok(&self) -> SdkResult<bool> {
         self.data
             .get("ok")
@@ -118,33 +146,64 @@ impl Frame {
             .ok_or_else(|| SdkError::frame_error("missing or invalid 'ok' field"))
     }
 
-    /// Get the error object from a response frame.
+    /// Read the remote error code and message from an error response.
     pub fn error(&self) -> Option<SdkResult<(String, String)>> {
-        let error_obj = self.data.get("error")?.as_object()?;
-        let code = error_obj.get("code")?.as_str()?.to_string();
-        let message = error_obj.get("message")?.as_str()?.to_string();
+        let error = self.data.get("error")?.as_object()?;
+        let code = error.get("code")?.as_str()?.to_string();
+        let message = error.get("message")?.as_str()?.to_string();
         Some(Ok((code, message)))
     }
 
-    /// Get the result field from a response frame.
+    /// Get the response result field.
     pub fn result(&self) -> Option<Value> {
         self.data.get("result").cloned()
     }
 
-    /// Convert to JSON string.
+    /// Serialize this frame to compact JSON.
     pub fn to_json(&self) -> SdkResult<String> {
         serde_json::to_string(&self.data)
-            .map_err(|e| SdkError::frame_error(format!("JSON serialization error: {}", e)))
+            .map_err(|error| SdkError::frame_error(format!("JSON serialization error: {error}")))
     }
 
-    /// Parse from JSON string.
-    pub fn from_json(json_str: &str) -> SdkResult<Self> {
-        let data: Map<String, Value> = serde_json::from_str(json_str)
-            .map_err(|e| SdkError::frame_error(format!("JSON parsing error: {}", e)))?;
-        Ok(Self::new(data))
+    /// Parse a JSON object as an SDK frame.
+    pub fn from_json(json: &str) -> SdkResult<Self> {
+        match serde_json::from_str::<Value>(json)
+            .map_err(|error| SdkError::frame_error(format!("JSON parsing error: {error}")))?
+        {
+            Value::Object(data) => Ok(Self::new(data)),
+            _ => Err(SdkError::frame_error("SDK frame must be a JSON object")),
+        }
     }
 
-    /// Create a broker hello frame.
+    /// Create the protocol-v3 client hello with the advertised capabilities.
+    pub fn client_hello(capabilities: &[String]) -> Self {
+        let mut data = Map::new();
+        data.insert("type".to_string(), Value::String("hello".to_string()));
+        data.insert(
+            "protocolVersion".to_string(),
+            Value::Number(PROTOCOL_VERSION.into()),
+        );
+        data.insert(
+            "capabilities".to_string(),
+            Value::Array(capabilities.iter().cloned().map(Value::String).collect()),
+        );
+        Self::new(data)
+    }
+
+    /// Return whether this frame completes a server hello handshake.
+    pub fn is_server_hello(&self) -> bool {
+        matches!(
+            self.data.get("type").and_then(Value::as_str),
+            Some("hello" | "server_hello" | "broker_hello")
+        )
+    }
+
+    /// Read an optional connection identifier from a server hello.
+    pub fn connection_id(&self) -> Option<&str> {
+        self.data.get("connectionId").and_then(Value::as_str)
+    }
+
+    /// Create a broker hello frame for protocol tests and mock servers.
     pub fn broker_hello() -> Self {
         let mut data = Map::new();
         data.insert(
@@ -158,63 +217,63 @@ impl Frame {
         Self::new(data)
     }
 
-    /// Create a broker request frame.
-    pub fn broker_request(id: String, operation: String, input: Value) -> Self {
+    /// Create a broker operation request frame.
+    pub fn broker_request(id: Uuid, operation: String, input: Value) -> Self {
         let mut data = Map::new();
         data.insert(
             "type".to_string(),
             Value::String("broker_request".to_string()),
         );
-        data.insert("id".to_string(), Value::String(id));
+        data.insert("id".to_string(), Value::String(id.to_string()));
         data.insert("operation".to_string(), Value::String(operation));
         data.insert("input".to_string(), input);
         Self::new(data)
     }
 
-    /// Create a broker response frame.
-    pub fn broker_response_ok(id: String, result: Value) -> Self {
+    /// Create a successful broker response frame.
+    pub fn broker_response_ok(id: Uuid, result: Value) -> Self {
         let mut data = Map::new();
         data.insert(
             "type".to_string(),
             Value::String("broker_response".to_string()),
         );
-        data.insert("id".to_string(), Value::String(id));
+        data.insert("id".to_string(), Value::String(id.to_string()));
         data.insert("ok".to_string(), Value::Bool(true));
         data.insert("result".to_string(), result);
         Self::new(data)
     }
 
-    /// Create a broker error response frame.
-    pub fn broker_response_error(id: String, code: String, message: String) -> Self {
-        let mut error_data = Map::new();
-        error_data.insert("code".to_string(), Value::String(code));
-        error_data.insert("message".to_string(), Value::String(message));
+    /// Create an error broker response frame.
+    pub fn broker_response_error(id: Uuid, code: String, message: String) -> Self {
+        let mut error = Map::new();
+        error.insert("code".to_string(), Value::String(code));
+        error.insert("message".to_string(), Value::String(message));
 
         let mut data = Map::new();
         data.insert(
             "type".to_string(),
             Value::String("broker_response".to_string()),
         );
-        data.insert("id".to_string(), Value::String(id));
+        data.insert("id".to_string(), Value::String(id.to_string()));
         data.insert("ok".to_string(), Value::Bool(false));
-        data.insert("error".to_string(), Value::Object(error_data));
+        data.insert("error".to_string(), Value::Object(error));
         Self::new(data)
     }
 
-    /// Get the payload size in bytes.
+    /// Get the serialized frame length in UTF-8 bytes.
     pub fn byte_size(&self) -> usize {
-        self.to_json().map(|s| s.len()).unwrap_or(0)
+        self.to_json().map_or(0, |json| json.len())
     }
 
-    /// Get the operation name from a broker request frame.
+    /// Read the operation name from a request frame.
     pub fn operation(&self) -> Option<String> {
         self.data
             .get("operation")
             .and_then(Value::as_str)
-            .map(String::from)
+            .map(str::to_owned)
     }
 
-    /// Get the input value from a broker request frame.
+    /// Read the request input object.
     pub fn input(&self) -> Option<Value> {
         self.data.get("input").cloned()
     }
@@ -226,7 +285,7 @@ mod tests {
 
     #[test]
     fn frame_type_round_trip() {
-        assert_eq!(FrameType::BrokerHello.as_str(), "broker_hello");
+        assert_eq!(FrameType::Hello.as_str(), "hello");
         assert_eq!(
             FrameType::parse("broker_hello").unwrap(),
             FrameType::BrokerHello
@@ -235,68 +294,76 @@ mod tests {
 
     #[test]
     fn frame_parsing_extracts_type() {
-        let frame = Frame::broker_hello();
-        assert_eq!(frame.frame_type().unwrap(), FrameType::BrokerHello);
-    }
-
-    #[test]
-    fn frame_with_id_can_be_recovered() {
-        let frame = Frame::broker_request(
-            "test-id".to_string(),
-            "test.operation".to_string(),
-            Value::Object(Map::new()),
+        assert_eq!(
+            SdkFrame::broker_hello().frame_type().unwrap(),
+            FrameType::BrokerHello
         );
-        assert_eq!(frame.id(), Some("test-id".to_string()));
     }
 
     #[test]
-    fn frame_json_round_trip() {
-        let frame = Frame::broker_hello();
-        let json_str = frame.to_json().unwrap();
-        let parsed = Frame::from_json(&json_str).unwrap();
-        assert_eq!(parsed.frame_type().unwrap(), FrameType::BrokerHello);
+    fn frame_id_round_trips_as_a_uuid() {
+        let id = Uuid::new_v4();
+        let frame = SdkFrame::broker_request(id, "test.operation".to_string(), Value::Null);
+        assert_eq!(frame.id().unwrap(), Some(id));
     }
 
     #[test]
-    fn broker_response_error_contains_code_and_message() {
-        let frame = Frame::broker_response_error(
-            "id1".to_string(),
+    fn json_round_trip_preserves_the_typed_frame() {
+        let frame = SdkFrame::client_hello(&["capability.one".to_string()]);
+        let parsed = SdkFrame::from_json(&frame.to_json().unwrap()).unwrap();
+        assert_eq!(parsed, frame);
+        assert_eq!(parsed.frame_type().unwrap(), FrameType::Hello);
+    }
+
+    #[test]
+    fn client_hello_advertises_protocol_and_capabilities() {
+        let frame = SdkFrame::client_hello(&["capability.one".to_string()]);
+        assert_eq!(frame.data["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(
+            frame.data["capabilities"],
+            serde_json::json!(["capability.one"])
+        );
+    }
+
+    #[test]
+    fn broker_error_response_exposes_code_and_message() {
+        let frame = SdkFrame::broker_response_error(
+            Uuid::new_v4(),
             "invalid_input".to_string(),
-            "test error".to_string(),
+            "bad input".to_string(),
         );
-        let (code, message) = frame.error().unwrap().unwrap();
-        assert_eq!(code, "invalid_input");
-        assert_eq!(message, "test error");
+        assert_eq!(
+            frame.error().unwrap().unwrap(),
+            ("invalid_input".into(), "bad input".into())
+        );
+        assert!(!frame.ok().unwrap());
     }
 
     #[test]
-    fn frame_extracts_operation_from_broker_request() {
-        let frame = Frame::broker_request(
-            "test-id".to_string(),
-            "query.list_sessions".to_string(),
-            Value::Object(Map::new()),
-        );
-        assert_eq!(frame.operation(), Some("query.list_sessions".to_string()));
-    }
-
-    #[test]
-    fn frame_extracts_input_from_broker_request() {
-        let input = Value::Object({
-            let mut m = Map::new();
-            m.insert("session_id".to_string(), Value::String("123".to_string()));
-            m
-        });
-        let frame = Frame::broker_request(
-            "test-id".to_string(),
+    fn operation_and_input_are_recoverable() {
+        let input = serde_json::json!({"session_id": "session-1"});
+        let frame = SdkFrame::broker_request(
+            Uuid::new_v4(),
             "query.get_session".to_string(),
             input.clone(),
         );
+        assert_eq!(frame.operation().as_deref(), Some("query.get_session"));
         assert_eq!(frame.input(), Some(input));
     }
 
     #[test]
-    fn frame_without_operation_returns_none() {
-        let frame = Frame::broker_hello();
-        assert_eq!(frame.operation(), None);
+    fn malformed_json_and_non_object_values_are_rejected() {
+        assert!(SdkFrame::from_json("{").is_err());
+        assert!(SdkFrame::from_json("[]").is_err());
+        assert!(SdkFrame::from_json("null").is_err());
+    }
+
+    #[test]
+    fn invalid_correlation_uuid_is_rejected() {
+        let frame = SdkFrame::from_json(r#"{"type":"broker_response","id":"not-a-uuid"}"#).unwrap();
+        assert_eq!(
+            frame.id().unwrap_err().code,
+            crate::error::SdkErrorCode::CorrelationError
+        );
     }
 }

@@ -16,7 +16,7 @@ pub mod frame;
 pub mod registry;
 pub mod transport;
 
-pub use error::{SdkError, SdkResult};
-pub use frame::{Frame, FrameType};
+pub use error::{SdkError, SdkErrorCode, SdkResult, SdkSentRecord};
+pub use frame::{FrameType, SdkFrame};
 pub use registry::{OperationMetadata, OperationRegistry, Schema};
-pub use transport::{SdkTransport, SdkTransportConfig};
+pub use transport::{SdkClient, SdkClientConfig};

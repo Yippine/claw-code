@@ -10,17 +10,18 @@
 //! - Schema validation for operation inputs/outputs
 //! - Discovery of available operations
 
-use sdk::{Frame, OperationMetadata, OperationRegistry, Schema};
+use sdk::{OperationMetadata, OperationRegistry, Schema, SdkFrame};
 use serde_json::json;
+use uuid::Uuid;
+
+fn test_id() -> Uuid {
+    Uuid::new_v4()
+}
 
 #[test]
 fn gap_sdk_allows_undefined_operations() {
     // BEFORE: No validation - any operation name is accepted
-    let frame = Frame::broker_request(
-        "test-id".to_string(),
-        "undefined.operation".to_string(),
-        json!({}),
-    );
+    let frame = SdkFrame::broker_request(test_id(), "undefined.operation".to_string(), json!({}));
 
     // The frame is created successfully with no validation
     assert_eq!(frame.operation(), Some("undefined.operation".to_string()));
@@ -48,9 +49,9 @@ fn fix_operation_registry_validates_operations() {
 #[test]
 fn gap_sdk_has_no_operation_discovery() {
     // BEFORE: No way to discover what operations are available
-    // The Frame struct has no way to enumerate operations
-    let frame = Frame::broker_request(
-        "test-id".to_string(),
+    // The SdkFrame struct has no way to enumerate operations
+    let frame = SdkFrame::broker_request(
+        test_id(),
         "query.list_sessions".to_string(),
         json!({"some": "input"}),
     );
@@ -84,14 +85,14 @@ fn fix_operation_registry_enables_discovery() {
 fn gap_sdk_has_no_input_schema_validation() {
     // BEFORE: No validation of input schemas
     // Any input shape is accepted for any operation
-    let frame_with_valid_input = Frame::broker_request(
-        "test-1".to_string(),
+    let frame_with_valid_input = SdkFrame::broker_request(
+        test_id(),
         "query.get_session".to_string(),
         json!({"session_id": "123"}), // Correct structure
     );
 
-    let frame_with_invalid_input = Frame::broker_request(
-        "test-2".to_string(),
+    let frame_with_invalid_input = SdkFrame::broker_request(
+        test_id(),
         "query.get_session".to_string(),
         json!({"wrong_field": "value"}), // Missing session_id, wrong field
     );
@@ -126,8 +127,8 @@ fn fix_operation_registry_validates_input_schemas() {
 #[test]
 fn gap_sdk_has_no_output_schema_validation() {
     // BEFORE: No validation of response schemas
-    let response_frame = Frame::broker_response_ok(
-        "test-id".to_string(),
+    let response_frame = SdkFrame::broker_response_ok(
+        test_id(),
         json!({"any": "response"}), // No validation of structure
     );
 
@@ -158,8 +159,8 @@ fn fix_operation_registry_validates_output_schemas() {
 #[test]
 fn gap_sdk_transports_ignore_operation_names() {
     // BEFORE: The transport layer sends any operation without validation
-    let frame = Frame::broker_request(
-        "req-123".to_string(),
+    let frame = SdkFrame::broker_request(
+        test_id(),
         "this.is.not.a.real.operation".to_string(),
         json!({"data": "value"}),
     );
@@ -175,11 +176,8 @@ fn fix_registry_integrates_with_frame_operations() {
     let registry = OperationRegistry::with_standard_operations();
 
     // Create a frame with a valid operation
-    let valid_frame = Frame::broker_request(
-        "req-123".to_string(),
-        "query.list_sessions".to_string(),
-        json!({}),
-    );
+    let valid_frame =
+        SdkFrame::broker_request(test_id(), "query.list_sessions".to_string(), json!({}));
 
     // Extract and validate the operation
     if let Some(op_name) = valid_frame.operation() {
@@ -189,11 +187,8 @@ fn fix_registry_integrates_with_frame_operations() {
     }
 
     // Create a frame with an invalid operation
-    let invalid_frame = Frame::broker_request(
-        "req-124".to_string(),
-        "invalid.operation".to_string(),
-        json!({}),
-    );
+    let invalid_frame =
+        SdkFrame::broker_request(test_id(), "invalid.operation".to_string(), json!({}));
 
     // Extract and validate the operation
     if let Some(op_name) = invalid_frame.operation() {
